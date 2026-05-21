@@ -27,6 +27,7 @@ class Attentionmech(nn.Module):
          self.query = nn.Linear(dim, dim, bias=None)  
          self.key = nn.Linear(dim, dim, bias= None)  
          self.value = nn.Linear(dim, dim, bias= None)  
+         self.out_proj = nn.Linear(dim, dim, bias=None)
          self.sftmx = torch.nn.Softmax(dim=-1)
          self.rope = RoPE(self.head_dim, max_seq_len=max_seq_len) if use_rope else None
 
@@ -56,7 +57,7 @@ class Attentionmech(nn.Module):
             logits = weights @ v
             logits = logits.transpose(1, 2).contiguous().reshape(B, T, D)
           
-            return logits  
+            return self.out_proj(logits)  
 
     
           
@@ -72,7 +73,6 @@ class Attentionmech(nn.Module):
 
 
              
-
 
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import json
 import re
+from pathlib import Path
 from collections import Counter, defaultdict
 from typing import Dict, List, Tuple
 
@@ -196,6 +197,20 @@ def load_text(path: str) -> str:
 def prepare_data(path, vocab_size: int =1000, max_encoded_tokens: int = 10_000, train_ratio: float = 0.9): 
    
    text = load_text(path)  
+   return prepare_text_data(
+      text,
+      vocab_size=vocab_size,
+      max_encoded_tokens=max_encoded_tokens,
+      train_ratio=train_ratio,
+   )
+
+
+def prepare_text_data(
+    text: str,
+    vocab_size: int = 1000,
+    max_encoded_tokens: int = 10_000,
+    train_ratio: float = 0.9,
+):
 
    tokenizer = BPE(vocab_size=vocab_size) 
    tokenizer.train(text)  
@@ -211,6 +226,48 @@ def prepare_data(path, vocab_size: int =1000, max_encoded_tokens: int = 10_000, 
    val_ids = torch.tensor(ids[split_idx:], dtype=torch.long)  
 
    return tokenizer, train_ids, val_ids  
+
+
+def prepare_text_data_cached(
+    text: str,
+    cache_name: str,
+    vocab_size: int = 1000,
+    max_encoded_tokens: int = 10_000,
+    train_ratio: float = 0.9,
+    cache_dir: str = "data/token_cache",
+):
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", cache_name)
+    prefix = (
+        f"{safe_name}_vocab{vocab_size}_tokens{max_encoded_tokens}"
+        f"_ratio{train_ratio}"
+    )
+    tokenizer_path = cache_path / f"{prefix}_tokenizer.json"
+    ids_path = cache_path / f"{prefix}_ids.pt"
+
+    if tokenizer_path.exists() and ids_path.exists():
+        tokenizer = BPE.load(str(tokenizer_path))
+        data = torch.load(ids_path, map_location="cpu")
+        return tokenizer, data["train_ids"], data["val_ids"]
+
+    tokenizer, train_ids, val_ids = prepare_text_data(
+        text,
+        vocab_size=vocab_size,
+        max_encoded_tokens=max_encoded_tokens,
+        train_ratio=train_ratio,
+    )
+    tokenizer.save(str(tokenizer_path))
+    torch.save(
+        {
+            "train_ids": train_ids,
+            "val_ids": val_ids,
+        },
+        ids_path,
+    )
+
+    return tokenizer, train_ids, val_ids
 
 
 
@@ -248,4 +305,7 @@ if __name__ == "__main__":
     print("train tokens:", len(train_ids), "val tokens:", len(val_ids))
     print("xb shape:", xb.shape)
     print("yb shape:", yb.shape)
-    
+
+
+
+     

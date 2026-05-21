@@ -1,0 +1,87 @@
+intelligence.   
+beyond words with clean intuition.   
+
+- reality before words.  
+- asking silly questions ?  
+- continue untill you reach foundational details.   
+- care  
+- falsifying 
+
+
+
+
+
+attention/optimizer experiments(various attention architecture with optims) 
+ - deepseek attentions type, with sparse one. 
+ - muon, aurora.  
+ - mhc residuals(https://chatgpt.com/c/699a9f16-b4bc-83aa-b0e7-57d6df56e502), att residuals   
+profiling(then comes more on hardware optim side)
+measured bottleneck
+custom kernel
+benchmark
+
+
+flashatt in triton 
+MoE models.
+
+exps: 
+- gqa exp (then checkpoints and kv-cache)
+- gelu vs swiglu  
+- muon 
+- mla deepseek 
+- deltanet kimi 
+- sparse att deepseek 
+- Mhc residuals: 
+   - LayerNorm vs RMSNorm
+   - pre-norm vs post-norm
+   - residual scaling
+   - parallel residual
+   - depth: 4, 6, 8, 12 layers if hardware allows
+-profilling and kernels
+- quantization  
+- kv cache  
+
+
+
+
+1. Model research layer
+   Architecture, optimizer, objective, residuals, attention variants.
+
+2. Training systems layer
+   Distributed training, tensor/pipeline/data/context parallelism, checkpointing, mixed precision.
+
+3. Kernel/performance layer
+   FlashAttention, Flash Linear Attention, Triton/CUDA kernels, memory layout.
+
+4. Inference/serving layer
+   KV cache, batching, quantization, vLLM, SGLang.
+
+
+ 
+
+
+- this experiments.  
+- writing kernels in C++ and triton(competitive programming)  
+- long horizon RL.   
+
+
+
+
+
+
+
+
+
+
+exps command:  
+
+ 1. python -m experiments.gqa_experiment --max-steps 20000
+ 2. python -m experiments.ffn_experiment --max-steps 20000   
+ 
+
+
+
+
+
+
+   

@@ -1,0 +1,38 @@
+Scaling Laws Experiment Summary
+
+Dataset/tokenizer:
+- Parameter Golf FineWeb sp1024 pre-tokenized shards
+- Vocab size: 1024
+- Position encoding: RoPE
+- Seed: 1337
+- Sequence length: 128
+- Optimizer: AdamW
+
+Data scaling, dim=128, num_heads=8, params=626,176:
+- 100k tokens: best_val_loss 4.5982 at step 1030
+- 200k tokens: best_val_loss 4.3819 at step 1880
+- 400k tokens: best_val_loss 4.2501 at step 1930
+- 800k tokens: best_val_loss 3.9766 at step 2970
+- 1.6M tokens: best_val_loss 3.7860 at step 4930
+- 3.2M tokens: best_val_loss 3.6319 at step 7980
+- 6.4M tokens: best_val_loss 3.5472 at step 11980
+
+Model scaling at 6.4M tokens:
+- dim=128, num_heads=8: best_val_loss 3.5472
+- dim=192, num_heads=12: best_val_loss 3.5292 at step 11910
+
+Takeaways:
+- Validation loss consistently improved as data increased.
+- The 6.4M-token dim=128 run is the current practical baseline.
+- dim=192 improved slightly, but dim=128 is cheaper and stable for repeated architecture experiments.
+
+Current benchmark baseline:
+- max_encoded_tokens: 6,400,000
+- dim: 128
+- num_heads: 8
+- batch_size: 16
+- eval_batch_size: 8
+- max_steps: 12,000
+- best_val_loss: 3.5472
+
+

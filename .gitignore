@@ -219,4 +219,20 @@ __marimo__/
 
 
 #files  
-notes.txt  
+  
+
+# local data/cache artifacts
+data/datasets/
+data/tokenizers/
+data/manifest.json
+data/docs_selected.jsonl
+data/docs_selected.source_manifest.json
+data/token_cache/
+data/hf_cache/
+experiment/scaling_laws_runs/
+
+# checkpoints 
+checkpoints/
+
+# large dataset text files
+data/*.txt

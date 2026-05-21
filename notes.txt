@@ -75,8 +75,10 @@ exps:
 
 exps command:  
 
- 1. python -m experiments.gqa_experiment --max-steps 20000
- 2. python -m experiments.ffn_experiment --max-steps 20000   
+ 1. python -m experiment.gqa_experiment --max-steps 20000
+ 2. python -m experiment.ffn_experiment --max-steps 20000   
+ 3. python -m experiment.optimizer_experiment --max-steps 20000
+ 
  
 
 

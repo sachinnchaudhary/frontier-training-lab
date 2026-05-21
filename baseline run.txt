@@ -1,0 +1,32 @@
+Baseline Run Notes
+
+Config:
+- Seed: 1337
+- Device: cuda
+- Batch size: 32
+- Sequence length: 128
+- Learning rate: 3e-4
+- Target vocab size: 9000
+- Actual vocab size: 4204
+- Max encoded tokens: 10000
+- Model size: 1,459,820 trainable parameters
+
+Latest normal training log:
+- Step 0: train_loss 8.4833, val_loss 8.4895, grad_norm 0.3009
+- Step 30: train_loss 7.3599, val_loss 7.7768, grad_norm 0.6111
+- Step 80: train_loss 6.5626, val_loss 7.3909, grad_norm 0.4003
+- Step 140: train_loss 5.8212, val_loss 7.3053, grad_norm 0.3421
+- Step 150: train_loss 5.6951, val_loss 7.3093, grad_norm 0.3058
+
+Throughput:
+- After warmup, tokens/sec was usually around 70k-78k.
+
+One-batch overfit observation:
+- Train loss dropped from about 8.44 to 0.0012.
+- Validation loss rose from about 8.45 to about 9.05.
+- Gradient norm became very small as the model memorized the fixed batch.
+
+Notes:
+- Tokenizer round-trip check passed on the synthetic dataset with 100% normalized word accuracy.
+- Some generated text can contain <UNK> when prompts include characters or symbols missing from tokenizer training data.
+- Validation loss decreasing first and then climbing means overfitting; best checkpoint should be chosen at the lowest validation loss, not the final step.

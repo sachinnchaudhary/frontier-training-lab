@@ -23,6 +23,18 @@ from model.deepseek_sparseatt import (
     deepseek_sparse_attention,
     init_deepseek_sparse_params,
 )
+from model.deepseek_csa import (
+    DeepSeekCSAConfig,
+    deepseek_hybrid_attention,
+    init_deepseek_csa_params,
+    init_deepseek_hca_params,
+)
+from model.deepseek_mhc import (
+    MHCConfig,
+    init_mhc_params,
+    mhc_block,
+    mhc_readout,
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +51,12 @@ class JaxLMConfig:
     chunk_size: int = 16
     index_dim: int = 32
     index_heads: int = 2
+    csa_compress_rate: int = 4
+    hca_compress_rate: int = 128
+    local_window_size: int = 128
+    num_mhc_streams: int = 4
+    mhc_hidden_dim: int = 256
+    mhc_sinkhorn_iters: int = 20
     num_routed_experts: int = 4
     num_shared_experts: int = 1
     top_k: int = 2
@@ -99,6 +117,35 @@ def _sparse_config(config: JaxLMConfig) -> DeepSeekSparseConfig:
     )
 
 
+def _csa_config(config: JaxLMConfig) -> DeepSeekCSAConfig:
+    return DeepSeekCSAConfig(
+        model_dim=config.model_dim,
+        num_heads=config.num_heads,
+        latent_dim=config.latent_dim,
+        rope_dim=config.rope_dim,
+        index_dim=config.index_dim,
+        index_heads=config.index_heads,
+        csa_compress_rate=config.csa_compress_rate,
+        top_k=config.top_k,
+        hca_compress_rate=config.hca_compress_rate,
+        local_window_size=config.local_window_size,
+        num_routed_experts=config.num_routed_experts,
+        num_shared_experts=config.num_shared_experts,
+        expert_hidden_dim=config.expert_hidden_dim,
+        eps=config.eps,
+    )
+
+
+def _mhc_config(config: JaxLMConfig) -> MHCConfig:
+    return MHCConfig(
+        model_dim=config.model_dim,
+        num_streams=config.num_mhc_streams,
+        hidden_dim=config.mhc_hidden_dim,
+        sinkhorn_iters=config.mhc_sinkhorn_iters,
+        eps=config.eps,
+    )
+
+
 def init_lm_params(key, config: JaxLMConfig):
     if config.model_dim != config.num_heads * config.head_dim:
         raise ValueError("model_dim must equal num_heads * head_dim")
@@ -109,6 +156,8 @@ def init_lm_params(key, config: JaxLMConfig):
     attn_config = _attention_config(config)
     kimi_config = _kimi_config(config)
     sparse_config = _sparse_config(config)
+    csa_config = _csa_config(config)
+    mhc_config = _mhc_config(config)
 
     blocks = []
     offset = 2
@@ -119,6 +168,19 @@ def init_lm_params(key, config: JaxLMConfig):
             attn_params = init_kimi_deltanet_params(keys[offset], kimi_config)
         elif config.attention_type == "deepseek_sparse":
             attn_params = init_deepseek_sparse_params(keys[offset], sparse_config)
+        elif config.attention_type == "deepseek_csa_hca":
+            csa_key, hca_key = jax.random.split(keys[offset])
+            attn_params = {
+                "csa": init_deepseek_csa_params(csa_key, csa_config),
+                "hca": init_deepseek_hca_params(hca_key, csa_config),
+            }
+        elif config.attention_type == "deepseek_csa_hca_mhc":
+            csa_key, hca_key, mhc_key = jax.random.split(keys[offset], 3)
+            attn_params = {
+                "csa": init_deepseek_csa_params(csa_key, csa_config),
+                "hca": init_deepseek_hca_params(hca_key, csa_config),
+                "mhc": init_mhc_params(mhc_key, mhc_config),
+            }
         else:
             raise ValueError(f"unknown attention_type: {config.attention_type}")
 
@@ -142,6 +204,8 @@ def transformer_block(x, block_params, config: JaxLMConfig):
     attn_config = _attention_config(config)
     kimi_config = _kimi_config(config)
     sparse_config = _sparse_config(config)
+    csa_config = _csa_config(config)
+    mhc_config = _mhc_config(config)
 
     h = rms_norm(x, block_params["attn_norm"], eps=config.eps)
     if config.attention_type == "mhla":
@@ -150,6 +214,32 @@ def transformer_block(x, block_params, config: JaxLMConfig):
         h = kimi_deltanet_parallel_chunkwise(h, block_params["attn"], kimi_config)
     elif config.attention_type == "deepseek_sparse":
         h = deepseek_sparse_attention(h, block_params["attn"], sparse_config)
+    elif config.attention_type == "deepseek_csa_hca":
+        h = deepseek_hybrid_attention(h, block_params["attn"], csa_config)
+    elif config.attention_type == "deepseek_csa_hca_mhc":
+        h_streams = jnp.broadcast_to(
+            h[:, :, None, :],
+            (h.shape[0], h.shape[1], config.num_mhc_streams, config.model_dim),
+        )
+
+        def layer_fn(h_in):
+            hybrid_params = {
+                "csa": block_params["attn"]["csa"],
+                "hca": block_params["attn"]["hca"],
+            }
+            return deepseek_hybrid_attention(h_in, hybrid_params, csa_config)
+
+        h_streams = mhc_block(
+            h_streams,
+            block_params["attn"]["mhc"],
+            mhc_config,
+            layer_fn,
+        )
+        x = mhc_readout(h_streams, block_params["attn"]["mhc"])
+
+        h = rms_norm(x, block_params["moe_norm"], eps=config.eps)
+        x = x + deepseek_moe(h, block_params["moe"], attn_config)
+        return x
     else:
         raise ValueError(f"unknown attention_type: {config.attention_type}")
     x = x + h

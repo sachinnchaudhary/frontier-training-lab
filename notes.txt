@@ -18,16 +18,10 @@ attention/optimizer experiments(various attention architecture with optims)
 profiling(then comes more on hardware optim side)
 measured bottleneck
 custom kernel
-benchmark
 
 
-flashatt in triton 
-MoE models.
 
 exps: 
-- gqa exp (then checkpoints and kv-cache)
-- gelu vs swiglu  
-- muon 
 - mla deepseek 
 - deltanet kimi 
 - sparse att deepseek 
@@ -60,25 +54,57 @@ exps:
  
 
 
-- this experiments.  
-- writing kernels in C++ and triton(competitive programming)  
-- long horizon RL.   
 
+for linux: 
+username: sac27
+pass: sachin@27
 
-
-
-
-
-
-
-
-
-exps command:  
-
- 1. python -m experiment.gqa_experiment --max-steps 20000
- 2. python -m experiment.ffn_experiment --max-steps 20000   
- 3. python -m experiment.optimizer_experiment --max-steps 20000
+paper to internalize: 
+ ds v2: https://arxiv.org/pdf/2405.04434 
+ kimi KDA: https://arxiv.org/pdf/2510.26692
+ deepseek v3.2: https://arxiv.org/pdf/2512.02556
+ deepseek v4: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf
  
+ 
+jax implementations + kernels:  
+ 
+ - deepseek csa and hca deterministic:(tilelang)   
+ - mhc residuals (tilelang) 
+ 
+
+
+things neeed to be done:    
+ - writing kernels in tilelang/triton. 
+ - reinforce, ppo, grpo, cispo and policy gradient methods.  
+ - their training scripts and entire architecture in repo
+  
+ 
+
+
+
+
+
+
+
+
+
+
+exps command:
+ wsl  
+ source ~/venvs/frontier-jax/bin/activate
+
+ exp1: XLA_PYTHON_CLIENT_PREALLOCATE=false python -m jax_training.train 
+ 
+ exp:2 XLA_PYTHON_CLIENT_PREALLOCATE=false python -m experiment.deepseek_mla_latent_sweep.run
+
+ exp:3 XLA_PYTHON_CLIENT_PREALLOCATE=false python -m experiment.kimi_deltanet_memory_sweep.run --mode pilot --runs all
+  
+ exp:4 XLA_PYTHON_CLIENT_PREALLOCATE=false python -m experiment.deepseek_sparse_topk_sweep.run --mode full
+ 
+ exp:5 XLA_PYTHON_CLIENT_PREALLOCATE=false python -m experiment.csa_hca_compression_sweep.run --mode full
+
+ exp:6 XLA_PYTHON_CLIENT_PREALLOCATE=false python -m experiment.mhc_depth_scaling_sweep.run --mode full
+
  
 
 

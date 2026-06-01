@@ -465,6 +465,7 @@ def run_training(train_config: TrainConfig, model_config: JaxLMConfig, dataset=N
                 "optimizer": train_config.optimizer_type,
                 "layers": model_config.num_layers,
                 "attn": model_config.attention_type,
+                "residual_type": model_config.residual_type,
                 "seed": train_config.seed,
                 "pos": "rope",
                 "norm": "rmsnorm",

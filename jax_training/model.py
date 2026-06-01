@@ -48,6 +48,7 @@ class JaxLMConfig:
     latent_dim: int
     rope_dim: int
     attention_type: str = "mhla"
+    residual_type: str = "ordinary"
     chunk_size: int = 16
     deltanet_key_dim: int | None = None
     deltanet_value_dim: int | None = None
@@ -242,6 +243,12 @@ def init_lm_params(key, config: JaxLMConfig):
     for _ in range(config.num_layers):
         if config.attention_type == "mha":
             attn_params = init_mha_params(keys[offset], config)
+        elif config.attention_type == "mha_mhc":
+            mha_key, mhc_key = jax.random.split(keys[offset])
+            attn_params = {
+                "mha": init_mha_params(mha_key, config),
+                "mhc": init_mhc_params(mhc_key, mhc_config),
+            }
         elif config.attention_type == "mhla":
             attn_params = init_mhla_params(keys[offset], attn_config)
         elif config.attention_type == "kimi_deltanet":
@@ -290,6 +297,26 @@ def transformer_block(x, block_params, config: JaxLMConfig):
     h = rms_norm(x, block_params["attn_norm"], eps=config.eps)
     if config.attention_type == "mha":
         h = mha_attention(h, block_params["attn"], config)
+    elif config.attention_type == "mha_mhc":
+        h_streams = jnp.broadcast_to(
+            h[:, :, None, :],
+            (h.shape[0], h.shape[1], config.num_mhc_streams, config.model_dim),
+        )
+
+        def layer_fn(h_in):
+            return mha_attention(h_in, block_params["attn"]["mha"], config)
+
+        h_streams = mhc_block(
+            h_streams,
+            block_params["attn"]["mhc"],
+            mhc_config,
+            layer_fn,
+        )
+        x = mhc_readout(h_streams, block_params["attn"]["mhc"])
+
+        h = rms_norm(x, block_params["moe_norm"], eps=config.eps)
+        x = x + deepseek_moe(h, block_params["moe"], attn_config)
+        return x
     elif config.attention_type == "mhla":
         h = mhlatent_attention(h, block_params["attn"], attn_config)
     elif config.attention_type == "kimi_deltanet":

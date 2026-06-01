@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import NamedTuple
 
@@ -13,6 +14,13 @@ import numpy as np
 
 from jax_training.data import get_batch, load_cached_lm_dataset
 from jax_training.model import JaxLMConfig, init_lm_params, loss_fn
+
+
+LATENT_SWEEP_DIMS = {
+    "small": 96,
+    "medium": 192,
+    "large": 384,
+}
 
 
 @dataclass(frozen=True)
@@ -39,7 +47,10 @@ class TrainConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
-    log_path: str = "experiment/jax_csa_hca_mhc_muon/summary.jsonl"
+    experiment_name: str = "deepseek_mla_latent_sweep"
+    latent_variant: str = "medium"
+    run_name: str = ""
+    log_path: str = ""
 
 
 class MuonAdamWState(NamedTuple):
@@ -245,27 +256,65 @@ def write_jsonl(path, payload):
         f.write(json.dumps(payload) + "\n")
 
 
-def main():
-    train_config = TrainConfig()
+def write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
 
-    print("devices:", jax.devices())
-    print("backend:", jax.default_backend())
 
-    dataset = load_cached_lm_dataset(
-        train_config.dataset_name,
-        max_encoded_tokens=train_config.max_encoded_tokens,
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run JAX MLA latent sweep training.")
+    parser.add_argument(
+        "--latent-variant",
+        choices=tuple(LATENT_SWEEP_DIMS),
+        default="medium",
+        help="Latent sweep variant to run.",
+    )
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--max-steps", type=int, default=30_000)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--seq-len", type=int, default=512)
+    parser.add_argument("--max-encoded-tokens", type=int, default=150_000_000)
+    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--eval-interval", type=int, default=250)
+    parser.add_argument("--eval-batches", type=int, default=20)
+    return parser.parse_args()
+
+
+def build_train_config(args) -> TrainConfig:
+    latent_dim = LATENT_SWEEP_DIMS[args.latent_variant]
+    run_name = f"deepseek_mla_latent{latent_dim}_muon_768d_6l_seq{args.seq_len}"
+    log_path = f"experiment/deepseek_mla_latent_sweep/{args.latent_variant}_latent/summary.jsonl"
+    return replace(
+        TrainConfig(),
+        seed=args.seed,
+        latent_variant=args.latent_variant,
+        run_name=run_name,
+        log_path=log_path,
+        max_steps=args.max_steps,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        max_encoded_tokens=args.max_encoded_tokens,
+        log_interval=args.log_interval,
+        eval_interval=args.eval_interval,
+        eval_batches=args.eval_batches,
     )
 
-    model_config = JaxLMConfig(
+
+def build_deepseek_mla_model_config(dataset, train_config: TrainConfig) -> JaxLMConfig:
+    latent_dim = LATENT_SWEEP_DIMS[train_config.latent_variant]
+    return JaxLMConfig(
         vocab_size=dataset.vocab_size,
-        max_seq_len=512,
+        max_seq_len=train_config.seq_len,
         model_dim=768,
         num_layers=6,
         num_heads=12,
         head_dim=64,
-        latent_dim=192,
+        latent_dim=latent_dim,
         rope_dim=32,
-        attention_type="deepseek_csa_hca_mhc",
+        attention_type="mhla",
         chunk_size=16,
         index_dim=64,
         index_heads=4,
@@ -281,6 +330,22 @@ def main():
         expert_hidden_dim=3072,
     )
 
+
+def first_block_mla_stats(params):
+    attn = params["blocks"][0]["attn"]
+    stats = {}
+    for name in ("q_down", "kv_down", "q_proj", "k_proj", "v_proj", "out_proj"):
+        if name in attn:
+            stats[f"{name}_norm"] = float(jnp.linalg.norm(attn[name]))
+    return stats
+
+
+def run_training(train_config: TrainConfig, model_config: JaxLMConfig, dataset=None):
+    if dataset is None:
+        dataset = load_cached_lm_dataset(
+            train_config.dataset_name,
+            max_encoded_tokens=train_config.max_encoded_tokens,
+        )
     key = jax.random.PRNGKey(train_config.seed)
     params = init_lm_params(key, model_config)
     params_total = param_count(params)
@@ -300,17 +365,27 @@ def main():
 
     run_header = {
         "event": "run_start",
+        "experiment_name": train_config.experiment_name,
+        "run_name": train_config.run_name,
         "train_config": asdict(train_config),
         "model_config": asdict(model_config),
         "params": params_total,
+        "param_million": params_total / 1_000_000,
+        "latent_ratio": model_config.latent_dim / model_config.model_dim,
+        "compression_ratio": model_config.model_dim / model_config.latent_dim,
         "backend": jax.default_backend(),
         "devices": [str(device) for device in jax.devices()],
     }
+    config_path = Path(train_config.log_path).with_name("config.json")
+    write_json(config_path, run_header)
     write_jsonl(train_config.log_path, run_header)
     print(
+        f"experiment={train_config.experiment_name} "
+        f"run={train_config.run_name} "
         f"params={params_total} "
         f"optimizer={train_config.optimizer_type} "
         f"attn={model_config.attention_type} "
+        f"latent_dim={model_config.latent_dim} "
         f"batch_size={train_config.batch_size} "
         f"seq_len={train_config.seq_len} "
         f"max_steps={train_config.max_steps}"
@@ -356,6 +431,7 @@ def main():
             now = time.time()
             elapsed = now - last_time
             steps = 1 if step == 1 else train_config.log_interval
+            step_time_ms = 1000.0 * elapsed / max(steps, 1)
             tokens_per_sec = (
                 train_config.batch_size
                 * train_config.seq_len
@@ -365,7 +441,11 @@ def main():
             last_time = now
             tokens_seen = step * train_config.batch_size * train_config.seq_len
             elapsed_total = now - start_time
+            param_stats = first_block_mla_stats(params)
             log = {
+                "experiment_name": train_config.experiment_name,
+                "run_name": train_config.run_name,
+                "latent_variant": train_config.latent_variant,
                 "step": step,
                 "train_loss": train_loss_f,
                 "val_loss": last_val_loss,
@@ -377,16 +457,27 @@ def main():
                 "tokens_sec": tokens_per_sec,
                 "tokens_seen": tokens_seen,
                 "elapsed_sec": elapsed_total,
+                "step_time_ms": step_time_ms,
                 "batch_size": train_config.batch_size,
                 "seq_len": train_config.seq_len,
                 "params": params_total,
+                "param_million": params_total / 1_000_000,
                 "optimizer": train_config.optimizer_type,
                 "layers": model_config.num_layers,
                 "attn": model_config.attention_type,
                 "seed": train_config.seed,
                 "pos": "rope",
                 "norm": "rmsnorm",
+                "model_dim": model_config.model_dim,
+                "num_heads": model_config.num_heads,
+                "head_dim": model_config.head_dim,
                 "latent_dim": model_config.latent_dim,
+                "latent_ratio": model_config.latent_dim / model_config.model_dim,
+                "compression_ratio": model_config.model_dim / model_config.latent_dim,
+                "rope_dim": model_config.rope_dim,
+                "max_steps": train_config.max_steps,
+                "warmup_steps": train_config.warmup_steps,
+                "weight_decay": train_config.weight_decay,
                 "csa_compress_rate": model_config.csa_compress_rate,
                 "hca_compress_rate": model_config.hca_compress_rate,
                 "local_window_size": model_config.local_window_size,
@@ -397,8 +488,10 @@ def main():
                 "top_k": model_config.top_k,
                 "expert_hidden_dim": model_config.expert_hidden_dim,
             }
+            log.update(param_stats)
             write_jsonl(train_config.log_path, log)
             print(
+                f"run={train_config.run_name} "
                 f"step={step} "
                 f"train_loss={train_loss_f:.4f} "
                 f"val_loss={last_val_loss:.4f} "
@@ -415,10 +508,27 @@ def main():
                 f"optimizer={train_config.optimizer_type} "
                 f"layers={model_config.num_layers} "
                 f"attn={model_config.attention_type} "
+                f"latent_dim={model_config.latent_dim} "
+                f"compression={model_config.model_dim / model_config.latent_dim:.2f} "
                 f"seed={train_config.seed} "
                 f"pos=rope "
                 f"norm=rmsnorm"
             )
+
+
+def main():
+    args = parse_args()
+    train_config = build_train_config(args)
+
+    print("devices:", jax.devices())
+    print("backend:", jax.default_backend())
+
+    dataset = load_cached_lm_dataset(
+        train_config.dataset_name,
+        max_encoded_tokens=train_config.max_encoded_tokens,
+    )
+    model_config = build_deepseek_mla_model_config(dataset, train_config)
+    run_training(train_config, model_config, dataset)
 
 
 if __name__ == "__main__":

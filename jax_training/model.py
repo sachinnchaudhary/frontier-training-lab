@@ -70,6 +70,77 @@ def _xavier(key, shape):
     return jax.random.uniform(key, shape, minval=-limit, maxval=limit)
 
 
+def init_mha_params(key, config: JaxLMConfig):
+    keys = jax.random.split(key, 4)
+    D = config.model_dim
+    return {
+        "q_proj": _xavier(keys[0], (D, D)),
+        "k_proj": _xavier(keys[1], (D, D)),
+        "v_proj": _xavier(keys[2], (D, D)),
+        "out_proj": _xavier(keys[3], (D, D)),
+    }
+
+
+def apply_rope_to_heads(x, rope_dim):
+    if rope_dim <= 0:
+        return x
+    if rope_dim % 2 != 0:
+        raise ValueError("rope_dim must be even")
+
+    rope_dim = min(rope_dim, x.shape[-1])
+    x_content = x[..., :-rope_dim]
+    x_rope = x[..., -rope_dim:]
+    half = rope_dim // 2
+    x1 = x_rope[..., :half]
+    x2 = x_rope[..., half:]
+
+    T = x.shape[1]
+    positions = jnp.arange(T, dtype=x.dtype)
+    freqs = 1.0 / (10000.0 ** (jnp.arange(half, dtype=x.dtype) / half))
+    angles = positions[:, None] * freqs[None, :]
+    cos = jnp.cos(angles)[None, :, None, :]
+    sin = jnp.sin(angles)[None, :, None, :]
+    rope = jnp.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
+    return jnp.concatenate([x_content, rope], axis=-1)
+
+
+def apply_causal_mask(scores):
+    T = scores.shape[-1]
+    mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+    return jnp.where(mask[None, None, :, :], scores, -jnp.inf)
+
+
+def mha_attention(x, params, config: JaxLMConfig):
+    B, T, D = x.shape
+    H = config.num_heads
+    Dh = config.head_dim
+
+    q = jnp.matmul(x, params["q_proj"])
+    k = jnp.matmul(x, params["k_proj"])
+    v = jnp.matmul(x, params["v_proj"])
+
+    q = jnp.reshape(q, (B, T, H, Dh))
+    k = jnp.reshape(k, (B, T, H, Dh))
+    v = jnp.reshape(v, (B, T, H, Dh))
+
+    q = apply_rope_to_heads(q, config.rope_dim)
+    k = apply_rope_to_heads(k, config.rope_dim)
+
+    q = jnp.transpose(q, (0, 2, 1, 3))
+    k = jnp.transpose(k, (0, 2, 1, 3))
+    v = jnp.transpose(v, (0, 2, 1, 3))
+
+    scores = jnp.matmul(q, jnp.swapaxes(k, -1, -2))
+    scores = scores / jnp.sqrt(jnp.asarray(Dh, dtype=x.dtype))
+    scores = apply_causal_mask(scores)
+
+    weights = jax.nn.softmax(scores, axis=-1)
+    out = jnp.matmul(weights, v)
+    out = jnp.transpose(out, (0, 2, 1, 3))
+    out = jnp.reshape(out, (B, T, D))
+    return jnp.matmul(out, params["out_proj"])
+
+
 def _attention_config(config: JaxLMConfig) -> MHLAConfig:
     return MHLAConfig(
         model_dim=config.model_dim,
@@ -162,7 +233,9 @@ def init_lm_params(key, config: JaxLMConfig):
     blocks = []
     offset = 2
     for _ in range(config.num_layers):
-        if config.attention_type == "mhla":
+        if config.attention_type == "mha":
+            attn_params = init_mha_params(keys[offset], config)
+        elif config.attention_type == "mhla":
             attn_params = init_mhla_params(keys[offset], attn_config)
         elif config.attention_type == "kimi_deltanet":
             attn_params = init_kimi_deltanet_params(keys[offset], kimi_config)
@@ -208,7 +281,9 @@ def transformer_block(x, block_params, config: JaxLMConfig):
     mhc_config = _mhc_config(config)
 
     h = rms_norm(x, block_params["attn_norm"], eps=config.eps)
-    if config.attention_type == "mhla":
+    if config.attention_type == "mha":
+        h = mha_attention(h, block_params["attn"], config)
+    elif config.attention_type == "mhla":
         h = mhlatent_attention(h, block_params["attn"], attn_config)
     elif config.attention_type == "kimi_deltanet":
         h = kimi_deltanet_parallel_chunkwise(h, block_params["attn"], kimi_config)

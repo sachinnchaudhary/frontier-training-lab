@@ -49,6 +49,9 @@ class JaxLMConfig:
     rope_dim: int
     attention_type: str = "mhla"
     chunk_size: int = 16
+    deltanet_key_dim: int | None = None
+    deltanet_value_dim: int | None = None
+    deltanet_gate_type: str = "vector"
     index_dim: int = 32
     index_heads: int = 2
     csa_compress_rate: int = 4
@@ -158,12 +161,15 @@ def _attention_config(config: JaxLMConfig) -> MHLAConfig:
 
 
 def _kimi_config(config: JaxLMConfig) -> KimiDeltaNetConfig:
+    key_dim = config.deltanet_key_dim or config.head_dim
+    value_dim = config.deltanet_value_dim or config.head_dim
     return KimiDeltaNetConfig(
         model_dim=config.model_dim,
         num_heads=config.num_heads,
-        key_dim=config.head_dim,
-        value_dim=config.head_dim,
+        key_dim=key_dim,
+        value_dim=value_dim,
         chunk_size=config.chunk_size,
+        gate_type=config.deltanet_gate_type,
         eps=config.eps,
         num_routed_experts=config.num_routed_experts,
         num_shared_experts=config.num_shared_experts,

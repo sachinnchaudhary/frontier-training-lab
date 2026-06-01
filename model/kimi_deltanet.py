@@ -56,6 +56,7 @@ class KimiDeltaNetConfig:
     key_dim: int
     value_dim: int
     chunk_size: int
+    gate_type: str = "vector"
     eps: float = 1e-6
     num_routed_experts: int = 4
     num_shared_experts: int = 1
@@ -75,12 +76,13 @@ def init_kimi_deltanet_params(key, config):
     H = config.num_heads
     Kd = config.key_dim
     Vd = config.value_dim
+    beta_out = H * Vd if config.gate_type == "vector" else H
     return {
         "q_proj": _xavier(keys[0], (D, H * Kd)),
         "k_proj": _xavier(keys[1], (D, H * Kd)),
         "v_proj": _xavier(keys[2], (D, H * Vd)),
         "alpha_proj": _xavier(keys[3], (D, H * Kd)),
-        "beta_proj": _xavier(keys[4], (D, H)),
+        "beta_proj": _xavier(keys[4], (D, beta_out)),
         "out_proj": _xavier(keys[5], (H * Vd, D)),
     }
 
@@ -110,7 +112,12 @@ def kimi_deltanet_stepwise(x, params, config):
         
         delta_t =  v_t - read_t 
 
-        S = S + b_t[..., None, None] * jnp.einsum("bhk,bhv->bhkv", k_t, delta_t)
+        if b_t.ndim == 2:
+             update = b_t[..., None, None] * jnp.einsum("bhk,bhv->bhkv", k_t, delta_t)
+        else:
+             update = jnp.einsum("bhk,bhv->bhkv", k_t, b_t * delta_t)
+
+        S = S + update
         
         out_t = jnp.einsum("bhk,bhkv->bhv", q_t, S)
 
@@ -217,11 +224,12 @@ def deltanet_chunk_scan(q_c, k_c, v_c, alpha_c, beta_c, S):
          read_i  = jnp.einsum("bhk,bhkv->bhv", k_i, S) 
          delta_i = v_i - read_i  
 
-         S = S + b_i[..., None, None] * jnp.einsum(
-              "bhk,bhv->bhkv",
-            k_i,
-            delta_i,
-         )
+         if b_i.ndim == 2:
+              update = b_i[..., None, None] * jnp.einsum("bhk,bhv->bhkv", k_i, delta_i)
+         else:
+              update = jnp.einsum("bhk,bhv->bhkv", k_i, b_i * delta_i)
+
+         S = S + update
 
          out_i = jnp.einsum("bhk,bhkv->bhv", q_i, S)
          outputs.append(out_i) 
@@ -237,7 +245,14 @@ def deltanet_chunk_fine_gated(q_c, k_c, v_c, alpha_c, beta_c, S0):
     v = jnp.transpose(v_c, [0, 2, 1, 3]) 
 
     alpha = jnp.transpose(alpha_c, [0, 2, 1, 3])
-    beta = jnp.transpose(beta_c, [0, 2, 1]) 
+    if beta_c.ndim == 3:
+        beta = jnp.transpose(beta_c, [0, 2, 1])
+        beta_value = beta[..., None]
+        beta_scalar = beta
+    else:
+        beta = jnp.transpose(beta_c, [0, 2, 1, 3])
+        beta_value = beta
+        beta_scalar = jnp.mean(beta, axis=-1)
 
     B, H, C, Kd = q.shape  
     Vd = v.shape[-1] 
@@ -250,14 +265,14 @@ def deltanet_chunk_fine_gated(q_c, k_c, v_c, alpha_c, beta_c, S0):
     k_s0 = jnp.einsum("bhck,bhckv->bhcv", k, S0_per_token)      
     q_s0 = jnp.einsum("bhck,bhckv->bhcv", q, S0_per_token) 
 
-    u = beta[..., None] * (v - k_s0)
+    u = beta_value * (v - k_s0)
 
     kk_decay = jnp.einsum("bhid,bhijd,bhjd->bhij", k, decay, k) 
     lower = jnp.tril(jnp.ones([C, C]), k =-1) 
 
     kk_lower = jnp.where(lower, kk_decay, 0.0) 
 
-    A = jnp.eye(C)[None, None, :, :] + beta[:, :, :, None] * kk_lower
+    A = jnp.eye(C)[None, None, :, :] + beta_scalar[:, :, :, None] * kk_lower
 
     W = solve_triangular(A, u, lower=True)
 
@@ -424,7 +439,14 @@ def project_inputs(x, params, config):
      k = jnp.reshape(k, (B, T, H, Kd))
      v = jnp.reshape(v, (B, T, H, Vd))
      alpha = jax.nn.sigmoid(jnp.reshape(alpha, (B, T, H, Kd)))
-     beta = jax.nn.sigmoid(jnp.reshape(beta, (B, T, H)))
+     if config.gate_type == "nogate":
+          beta = jnp.ones((B, T, H), dtype=x.dtype)
+     elif config.gate_type == "scalar":
+          beta = jax.nn.sigmoid(jnp.reshape(beta, (B, T, H)))
+     elif config.gate_type == "vector":
+          beta = jax.nn.sigmoid(jnp.reshape(beta, (B, T, H, Vd)))
+     else:
+          raise ValueError(f"unknown gate_type: {config.gate_type}")
 
      q = l2_normalize(q)
      k = l2_normalize(k)

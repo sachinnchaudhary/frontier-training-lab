@@ -222,6 +222,8 @@ __marimo__/
 notes.txt  
 
 # local data/cache artifacts
+.triton_cache/
+.venv-jax/
 data/datasets/
 data/tokenizers/
 data/manifest.json
@@ -230,6 +232,7 @@ data/docs_selected.source_manifest.json
 data/token_cache/
 data/hf_cache/
 experiment/scaling_laws_runs/
+experiment/*_smoke_runs/
 
 # checkpoints 
 checkpoints/

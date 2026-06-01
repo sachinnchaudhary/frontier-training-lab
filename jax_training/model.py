@@ -63,6 +63,7 @@ class JaxLMConfig:
     num_routed_experts: int = 4
     num_shared_experts: int = 1
     top_k: int = 2
+    moe_top_k: int = 2
     expert_hidden_dim: int = 2048
     eps: float = 1e-6
 
@@ -154,7 +155,7 @@ def _attention_config(config: JaxLMConfig) -> MHLAConfig:
         num_experts=config.num_routed_experts,
         num_routed_experts=config.num_routed_experts,
         num_shared_experts=config.num_shared_experts,
-        top_k=config.top_k,
+        top_k=config.moe_top_k,
         expert_hidden_dim=config.expert_hidden_dim,
         eps=config.eps,
     )
@@ -173,7 +174,7 @@ def _kimi_config(config: JaxLMConfig) -> KimiDeltaNetConfig:
         eps=config.eps,
         num_routed_experts=config.num_routed_experts,
         num_shared_experts=config.num_shared_experts,
-        top_k=config.top_k,
+        top_k=config.moe_top_k,
         expert_hidden_dim=config.expert_hidden_dim,
     )
 

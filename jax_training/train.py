@@ -475,6 +475,8 @@ def run_training(train_config: TrainConfig, model_config: JaxLMConfig, dataset=N
                 "latent_ratio": model_config.latent_dim / model_config.model_dim,
                 "compression_ratio": model_config.model_dim / model_config.latent_dim,
                 "rope_dim": model_config.rope_dim,
+                "index_dim": model_config.index_dim,
+                "index_heads": model_config.index_heads,
                 "key_dim": model_config.deltanet_key_dim or model_config.head_dim,
                 "value_dim": model_config.deltanet_value_dim or model_config.head_dim,
                 "state_dim": model_config.deltanet_key_dim or model_config.head_dim,
@@ -494,6 +496,7 @@ def run_training(train_config: TrainConfig, model_config: JaxLMConfig, dataset=N
                 "num_routed_experts": model_config.num_routed_experts,
                 "num_shared_experts": model_config.num_shared_experts,
                 "top_k": model_config.top_k,
+                "moe_top_k": model_config.moe_top_k,
                 "expert_hidden_dim": model_config.expert_hidden_dim,
             }
             log.update(param_stats)

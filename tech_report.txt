@@ -610,6 +610,42 @@ mHC route/merge Triton prototypes:
     - Best small/mid case: 5.87x.
     - Larger cases stayed positive, about 1.88x to 3.56x.
 
+DeepSeekMoE combine Triton prototype:
+- Added a non-GEMM MoE combine kernel in kernels/deepseek_moe_combine.py.
+- Scope:
+  - Framework/PyTorch still owns expert MLP GEMMs.
+  - Triton owns top-2 router selection, softmax over selected logits,
+    weighted routed expert combine, and shared expert add.
+- Forward inputs:
+  - router_logits: [N, E]
+  - expert_outputs: [N, E, D]
+  - shared_out: [N, D]
+- Forward outputs:
+  - out: [N, D]
+  - top_indices: [N, 2]
+  - router_weights: [N, 2]
+- Backward outputs:
+  - drouter_logits: [N, E]
+  - dexpert_outputs: [N, E, D]
+  - dshared_out: [N, D]
+- Correctness:
+  - forward error around 1e-7 to 1e-6.
+  - top-index match was exact.
+  - router weight error around 3e-8 to 1e-7.
+  - small backward check:
+    - drouter error around 2.2e-7.
+    - dexpert error around 6e-8.
+    - dshared error 0.
+- Latest observed speedups on RTX 2050-safe sizes:
+  - Forward: mostly about 2.7x to 4.5x.
+  - Backward: about 3.2x to 11x on runnable PyTorch-reference cases.
+  - Larger backward reference cases were skipped because PyTorch autograd
+    became memory-heavy on the 4 GB GPU.
+- Main lesson:
+  - MoE routing/combine is a strong non-GEMM kernel target because it fuses
+    top-k selection, selected softmax, indexed expert-output loads, weighted
+    combine, and backward scatter into a small number of kernels.
+
 
 11. Next Steps
 ==============

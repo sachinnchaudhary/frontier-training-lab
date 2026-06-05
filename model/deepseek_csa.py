@@ -29,7 +29,174 @@ def _xavier(key, shape):
     return jax.random.uniform(key, shape, minval=-limit, maxval=limit)
 
 
+def validate_deepseek_csa_config(config):
+    if config.model_dim < 1:
+        raise ValueError("model_dim must be >= 1")
+    if config.num_heads < 1:
+        raise ValueError("num_heads must be >= 1")
+    if config.latent_dim < 1:
+        raise ValueError("latent_dim must be >= 1")
+    if config.rope_dim < 1:
+        raise ValueError("rope_dim must be >= 1")
+    if config.rope_dim % 2 != 0:
+        raise ValueError("rope_dim must be even")
+    if config.index_dim < 1:
+        raise ValueError("index_dim must be >= 1")
+    if config.index_heads < 1:
+        raise ValueError("index_heads must be >= 1")
+    if config.csa_compress_rate < 1:
+        raise ValueError("csa_compress_rate must be >= 1")
+    if config.hca_compress_rate < 1:
+        raise ValueError("hca_compress_rate must be >= 1")
+    if config.local_window_size < 1:
+        raise ValueError("local_window_size must be >= 1")
+    if config.top_k < 1:
+        raise ValueError("top_k must be >= 1")
+    if config.num_routed_experts < 1:
+        raise ValueError("num_routed_experts must be >= 1")
+    if config.num_shared_experts < 1:
+        raise ValueError("num_shared_experts must be >= 1")
+
+
+def _validate_shapes(params, expected_shapes, owner):
+    for name, expected_shape in expected_shapes.items():
+        if name not in params:
+            raise KeyError(f"missing {owner} param: {name}")
+        if params[name].shape != expected_shape:
+            raise ValueError(
+                f"{owner}.{name} has shape {params[name].shape}, "
+                f"expected {expected_shape}"
+            )
+
+
+def validate_deepseek_csa_params(params, config):
+    D = config.model_dim
+    H = config.num_heads
+    C = config.latent_dim
+    R = config.rope_dim
+    Ih = config.index_heads
+    I = config.index_dim
+
+    _validate_shapes(
+        params,
+        {
+            "q_down": (D, C),
+            "kv_down": (D, C),
+            "q_absorb": (C, H * C),
+            "q_rope": (C, H * R),
+            "fusion_proj": (D, 1),
+            "idx_q": (D, Ih * I),
+            "idx_w": (D, Ih),
+            "idx_k": (D, Ih * I),
+            "out_proj": (H * C, D),
+        },
+        "csa",
+    )
+
+
+def validate_deepseek_hca_params(params, config):
+    D = config.model_dim
+    H = config.num_heads
+    C = config.latent_dim
+    R = config.rope_dim
+
+    _validate_shapes(
+        params,
+        {
+            "q_down": (D, C),
+            "kv_down": (D, C),
+            "q_absorb": (C, H * C),
+            "q_rope": (C, H * R),
+            "fusion_proj": (D, 1),
+            "out_proj": (H * C, D),
+        },
+        "hca",
+    )
+
+
+def validate_csa_inputs(x, params, config):
+    validate_deepseek_csa_config(config)
+    if x.ndim != 3:
+        raise ValueError(f"x must be [B, T, D], got {x.shape}")
+    if x.shape[-1] != config.model_dim:
+        raise ValueError(
+            f"x last dim is {x.shape[-1]}, expected model_dim={config.model_dim}"
+        )
+    block_count = (x.shape[1] + config.csa_compress_rate - 1) // config.csa_compress_rate
+    if config.top_k > block_count:
+        raise ValueError(
+            f"top_k={config.top_k} cannot exceed CSA block_count={block_count}"
+        )
+    validate_deepseek_csa_params(params, config)
+
+
+def validate_hca_inputs(x, params, config):
+    validate_deepseek_csa_config(config)
+    if x.ndim != 3:
+        raise ValueError(f"x must be [B, T, D], got {x.shape}")
+    if x.shape[-1] != config.model_dim:
+        raise ValueError(
+            f"x last dim is {x.shape[-1]}, expected model_dim={config.model_dim}"
+        )
+    validate_deepseek_hca_params(params, config)
+
+
+def _validate_expert_params(expert_params, config, expert_name):
+    D = config.model_dim
+    hidden = config.expert_hidden_dim
+    _validate_shapes(
+        expert_params,
+        {
+            "gate_proj": (D, hidden),
+            "up_proj": (D, hidden),
+            "down_proj": (hidden, D),
+        },
+        expert_name,
+    )
+
+
+def validate_deepseek_moe_params(params, config):
+    D = config.model_dim
+    E = config.num_routed_experts
+    S = config.num_shared_experts
+
+    if config.top_k > E:
+        raise ValueError("top_k must be <= num_routed_experts for MoE routing")
+
+    _validate_shapes(params, {"router": (D, E)}, "moe")
+
+    if "shared_experts" not in params:
+        raise KeyError("missing moe param: shared_experts")
+    if "routed_experts" not in params:
+        raise KeyError("missing moe param: routed_experts")
+    if len(params["shared_experts"]) != S:
+        raise ValueError(
+            f"got {len(params['shared_experts'])} shared experts, expected {S}"
+        )
+    if len(params["routed_experts"]) != E:
+        raise ValueError(
+            f"got {len(params['routed_experts'])} routed experts, expected {E}"
+        )
+
+    for shared_id, expert_params in enumerate(params["shared_experts"]):
+        _validate_expert_params(expert_params, config, f"shared_experts[{shared_id}]")
+    for expert_id, expert_params in enumerate(params["routed_experts"]):
+        _validate_expert_params(expert_params, config, f"routed_experts[{expert_id}]")
+
+
+def validate_moe_inputs(x, params, config):
+    validate_deepseek_csa_config(config)
+    if x.ndim != 3:
+        raise ValueError(f"x must be [B, T, D], got {x.shape}")
+    if x.shape[-1] != config.model_dim:
+        raise ValueError(
+            f"x last dim is {x.shape[-1]}, expected model_dim={config.model_dim}"
+        )
+    validate_deepseek_moe_params(params, config)
+
+
 def init_deepseek_csa_params(key, config):
+    validate_deepseek_csa_config(config)
     keys = jax.random.split(key, 9)
     D = config.model_dim
     H = config.num_heads
@@ -52,6 +219,7 @@ def init_deepseek_csa_params(key, config):
 
 
 def init_deepseek_hca_params(key, config):
+    validate_deepseek_csa_config(config)
     keys = jax.random.split(key, 6)
     D = config.model_dim
     H = config.num_heads
@@ -69,6 +237,7 @@ def init_deepseek_hca_params(key, config):
 
 
 def init_deepseek_moe_params(key, config):
+    validate_deepseek_csa_config(config)
     D = config.model_dim
     E = config.num_routed_experts
     S = config.num_shared_experts
@@ -272,6 +441,7 @@ PHASE 5: OUTPUT
 
 
 def deepseek_csa_attention(x, params, config):  
+   validate_csa_inputs(x, params, config)
    
    B, T, D = x.shape 
    H = config.num_heads
@@ -332,8 +502,14 @@ def deepseek_csa_attention(x, params, config):
    
    scores = jnp.einsum("bthd,btkd->bthk", q, selected_keys)
    scores = scores / jnp.sqrt(jnp.asarray(C + R, dtype=x.dtype))
+   selected_valid = selected_causal_block_valid(
+      top_indices,
+      token_count=T,
+      compress_rate=config.csa_compress_rate,
+   )
+   scores = jnp.where(selected_valid[:, :, None, :], scores, -jnp.inf)
 
-   probs = jax.nn.softmax(scores, axis=-1) 
+   probs = safe_masked_softmax(scores, selected_valid[:, :, None, :], axis=-1) 
 
    out = jnp.einsum("bthk,btkc->bthc", probs, selected_vals)
 
@@ -346,6 +522,7 @@ def deepseek_csa_attention(x, params, config):
 
 
 def deepseek_hca_attention(x, params, config):
+    validate_hca_inputs(x, params, config)
 
     B, T, D = x.shape 
     H = config.num_heads
@@ -387,7 +564,12 @@ def deepseek_hca_attention(x, params, config):
         compress_rate=config.hca_compress_rate,
     )
 
-    chunk_probs = jax.nn.softmax(chunk_scores, axis=-1)  
+    chunk_valid = causal_chunk_valid(
+        token_count=T,
+        block_count=N,
+        compress_rate=config.hca_compress_rate,
+    )
+    chunk_probs = safe_masked_softmax(chunk_scores, chunk_valid[None, :, None, :], axis=-1)  
     chunk_out = jnp.einsum("bthn,bnc->bthc", chunk_probs, chunk_vals) 
 
     local_scores = jnp.einsum("bthd,bsd->bths", q, local_keys)
@@ -421,6 +603,17 @@ def rms_norm(x, weight=None, eps=1e-6):
 
 
 def deepseek_csa_hca_moe_block(x, params, config):
+    if params["attn_norm"].shape != (config.model_dim,):
+        raise ValueError(
+            f"attn_norm has shape {params['attn_norm'].shape}, "
+            f"expected {(config.model_dim,)}"
+        )
+    if params["moe_norm"].shape != (config.model_dim,):
+        raise ValueError(
+            f"moe_norm has shape {params['moe_norm'].shape}, "
+            f"expected {(config.model_dim,)}"
+        )
+
     h = rms_norm(x, params["attn_norm"], config.eps)
 
     attn_out = deepseek_hybrid_attention(h, params["attn"], config)
@@ -437,6 +630,7 @@ def deepseek_csa_hca_moe_block(x, params, config):
 
 
 def deepseek_moe(x, params, config):  
+    validate_moe_inputs(x, params, config)
 
     B, T, D = x.shape
     
@@ -514,7 +708,7 @@ def hca_compress_blocks(x, c_kv, params, config):
     weights = jax.nn.softmax(logits, axis=2)
     c_blocks = jnp.sum(weights * c_blk, axis=2)
 
-    block_positions = jnp.arange(N) * M
+    block_positions = jnp.arange(N) * M + (M - 1)
     block_rope = rope_embedding(block_positions, config.rope_dim)
 
     return c_blocks, block_rope
@@ -560,7 +754,7 @@ def csa_compress_blocks(x, c_kv, params, config):
     c_blocks = jnp.sum(weights * c_blk, axis=2) 
     block_repr = jnp.sum(weights * x_blk, axis=2)  
     
-    block_positions = jnp.arange(N) * M  
+    block_positions = jnp.arange(N) * M + (M - 1)
     block_rope = rope_embedding(block_positions,config.rope_dim) 
 
     return c_blocks, block_repr, block_rope 
@@ -570,12 +764,11 @@ def csa_compress_blocks(x, c_kv, params, config):
 def apply_causal_block_mask(index_score, config):  
   
   B, T, N = index_score.shape 
-  M = config.csa_compress_rate  
-
-  token_pos = jnp.arange(T)  
-  block_start = jnp.arange(N) * M
-
-  mask = block_start[None, :] <= token_pos[:, None]
+  mask = causal_chunk_valid(
+      token_count=T,
+      block_count=N,
+      compress_rate=config.csa_compress_rate,
+  )
 
   index_score = jnp.where(
       mask[None, :, :], 
@@ -589,11 +782,34 @@ def apply_causal_block_mask(index_score, config):
 def apply_causal_chunk_mask(scores, compress_rate):
   B, T, H, N = scores.shape
 
-  token_pos = jnp.arange(T)
-  block_start = jnp.arange(N) * compress_rate
-  mask = block_start[None, :] <= token_pos[:, None]
+  mask = causal_chunk_valid(
+      token_count=T,
+      block_count=N,
+      compress_rate=compress_rate,
+  )
 
   return jnp.where(mask[None, :, None, :], scores, -jnp.inf)
+
+
+def causal_chunk_valid(token_count, block_count, compress_rate):
+  token_pos = jnp.arange(token_count)
+  block_end = jnp.arange(block_count) * compress_rate + (compress_rate - 1)
+  # A compressed block is visible only after every token inside it is visible.
+  return block_end[None, :] <= token_pos[:, None]
+
+
+def selected_causal_block_valid(top_indices, token_count, compress_rate):
+  token_pos = jnp.arange(token_count)[None, :, None]
+  block_end = top_indices * compress_rate + (compress_rate - 1)
+  return block_end <= token_pos
+
+
+def safe_masked_softmax(scores, mask, axis=-1):
+  masked_scores = jnp.where(mask, scores, -jnp.inf)
+  has_valid = jnp.any(mask, axis=axis, keepdims=True)
+  safe_scores = jnp.where(has_valid, masked_scores, 0.0)
+  probs = jax.nn.softmax(safe_scores, axis=axis)
+  return jnp.where(mask, probs, 0.0)
 
 
 def apply_local_causal_mask(scores, local_window_size):

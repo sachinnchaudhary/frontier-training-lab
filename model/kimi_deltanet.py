@@ -97,33 +97,8 @@ def kimi_deltanet_stepwise(x, params, config):
     q, k, v, alpha, beta = project_inputs(x, params, config)
 
     S = jnp.zeros([B, H, Kd, Vd]) 
-    outputs = []  
 
-    for t in range(T):  
-        q_t  = q[:, t]
-        k_t  = k[:, t]
-        v_t  = v[:, t]
-        a_t = alpha[:, t]
-        b_t  = beta[:, t] 
-    
-        S = S  * a_t[..., : , None]  
-
-        read_t = jax.numpy.einsum("bhk,bhkv->bhv", k_t, S)
-        
-        delta_t =  v_t - read_t 
-
-        if b_t.ndim == 2:
-             update = b_t[..., None, None] * jnp.einsum("bhk,bhv->bhkv", k_t, delta_t)
-        else:
-             update = jnp.einsum("bhk,bhv->bhkv", k_t, b_t * delta_t)
-
-        S = S + update
-        
-        out_t = jnp.einsum("bhk,bhkv->bhv", q_t, S)
-
-        outputs.append(out_t)  
-
-    out = jnp.stack(outputs, axis=1) 
+    _, out = scan_deltanet_recurrence(q, k, v, alpha, beta, S)
     out = jnp.reshape(out, [B, T, H* Vd])  
     out = jnp.matmul(out, params["out_proj"])  
     return out
@@ -206,23 +181,35 @@ def merge_heads(x):
 
 def deltanet_chunk_scan(q_c, k_c, v_c, alpha_c, beta_c, S):  
 
-    B, C, H, Kd = q_c.shape
-    Vd = S.shape[-1]
+    S_final, out = scan_deltanet_recurrence(q_c, k_c, v_c, alpha_c, beta_c, S)
+    return out, S_final
 
-    outputs = []  
 
-    for i in range(C):  
-         q_i = q_c[:, i]  
-         k_i = k_c[:, i] 
-         v_i = v_c[:, i] 
+def scan_deltanet_recurrence(q, k, v, alpha, beta, S0):
+    """
+    Compiled stepwise DeltaNet recurrence.
 
-         a_i = alpha_c[:, i] 
-         b_i = beta_c[:, i]  
-    
-         S = S * a_i[..., :, None]  
+    q/k/alpha: [B, T, H, Kd]
+    v:         [B, T, H, Vd]
+    beta:      [B, T, H] for nogate/scalar, or [B, T, H, Vd] for vector gate
+    S0:        [B, H, Kd, Vd]
 
-         read_i  = jnp.einsum("bhk,bhkv->bhv", k_i, S) 
-         delta_i = v_i - read_i  
+    returns:
+      S_final: [B, H, Kd, Vd]
+      out:     [B, T, H, Vd]
+    """
+    q_t = jnp.swapaxes(q, 0, 1)
+    k_t = jnp.swapaxes(k, 0, 1)
+    v_t = jnp.swapaxes(v, 0, 1)
+    alpha_t = jnp.swapaxes(alpha, 0, 1)
+    beta_t = jnp.swapaxes(beta, 0, 1)
+
+    def step(S, inputs):
+         q_i, k_i, v_i, a_i, b_i = inputs
+         S = S * a_i[..., :, None]
+
+         read_i = jnp.einsum("bhk,bhkv->bhv", k_i, S)
+         delta_i = v_i - read_i
 
          if b_i.ndim == 2:
               update = b_i[..., None, None] * jnp.einsum("bhk,bhv->bhkv", k_i, delta_i)
@@ -230,11 +217,11 @@ def deltanet_chunk_scan(q_c, k_c, v_c, alpha_c, beta_c, S):
               update = jnp.einsum("bhk,bhv->bhkv", k_i, b_i * delta_i)
 
          S = S + update
-
          out_i = jnp.einsum("bhk,bhkv->bhv", q_i, S)
-         outputs.append(out_i) 
+         return S, out_i
 
-    return jnp.stack(outputs, axis=1), S  
+    S_final, out_t = jax.lax.scan(step, S0, (q_t, k_t, v_t, alpha_t, beta_t))
+    return S_final, jnp.swapaxes(out_t, 0, 1)
 
 
 
@@ -248,11 +235,11 @@ def deltanet_chunk_fine_gated(q_c, k_c, v_c, alpha_c, beta_c, S0):
     if beta_c.ndim == 3:
         beta = jnp.transpose(beta_c, [0, 2, 1])
         beta_value = beta[..., None]
-        beta_scalar = beta
+        beta_is_vector = False
     else:
         beta = jnp.transpose(beta_c, [0, 2, 1, 3])
         beta_value = beta
-        beta_scalar = jnp.mean(beta, axis=-1)
+        beta_is_vector = True
 
     B, H, C, Kd = q.shape  
     Vd = v.shape[-1] 
@@ -272,9 +259,17 @@ def deltanet_chunk_fine_gated(q_c, k_c, v_c, alpha_c, beta_c, S0):
 
     kk_lower = jnp.where(lower, kk_decay, 0.0) 
 
-    A = jnp.eye(C)[None, None, :, :] + beta_scalar[:, :, :, None] * kk_lower
-
-    W = solve_triangular(A, u, lower=True)
+    if beta_is_vector:
+        A = (
+            jnp.eye(C)[None, None, None, :, :]
+            + jnp.transpose(beta_value, [0, 1, 3, 2])[:, :, :, :, None]
+            * kk_lower[:, :, None, :, :]
+        )
+        U = jnp.transpose(u, [0, 1, 3, 2])
+        W = jnp.transpose(solve_triangular_per_value(A, U, lower=True), [0, 1, 3, 2])
+    else:
+        A = jnp.eye(C)[None, None, :, :] + beta[:, :, :, None] * kk_lower
+        W = solve_triangular(A, u, lower=True)
 
     qk_decay = jnp.einsum("bhid,bhijd,bhjd->bhij", q, decay, k)
     causal = jnp.tril(jnp.ones((C, C)), k=0)
@@ -399,6 +394,31 @@ def solve_triangular(A, U, lower=True):
      W = solve_batch(A, U)  
 
      return W
+
+
+def solve_triangular_per_value(A, U, lower=True):
+     """
+     Solve one lower-triangular system per batch, head, and value dimension.
+
+     A: [B, H, Vd, C, C]
+     U: [B, H, Vd, C]
+
+     returns:
+       W: [B, H, Vd, C]
+     """
+
+     def solve_one_value(A_bhv, U_bhv):
+         return jax.scipy.linalg.solve_triangular(
+             A_bhv,
+             U_bhv,
+             lower=lower,
+         )
+
+     solve_values = jax.vmap(solve_one_value, in_axes=(0, 0))
+     solve_heads = jax.vmap(solve_values, in_axes=(0, 0))
+     solve_batch = jax.vmap(solve_heads, in_axes=(0, 0))
+
+     return solve_batch(A, U)
 
 def build_end_decay(prefix): 
     

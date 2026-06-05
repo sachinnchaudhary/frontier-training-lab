@@ -87,7 +87,68 @@ def _xavier(key, shape):
     return jax.random.uniform(key, shape, minval=-limit, maxval=limit)
 
 
+def validate_mhc_config(config):
+    if config.model_dim < 1:
+        raise ValueError("model_dim must be >= 1")
+    if config.num_streams < 1:
+        raise ValueError("num_streams must be >= 1")
+    if config.hidden_dim < 1:
+        raise ValueError("hidden_dim must be >= 1")
+    if config.sinkhorn_iters < 1:
+        raise ValueError("sinkhorn_iters must be >= 1")
+    if config.eps <= 0:
+        raise ValueError("eps must be > 0")
+
+
+def validate_mhc_params(params, config):
+    route_dim = config.num_streams * config.model_dim
+    N = config.num_streams
+    D = config.model_dim
+    hidden = config.hidden_dim
+
+    expected_shapes = {
+        "route_norm": (route_dim,),
+        "pre_proj": (route_dim, N),
+        "pre_bias": (N,),
+        "post_proj": (route_dim, N),
+        "post_bias": (N,),
+        "res_proj": (route_dim, N * N),
+        "res_bias": (N * N,),
+        "layer_norm": (D,),
+        "layer_gate": (D, hidden),
+        "layer_up": (D, hidden),
+        "layer_down": (hidden, D),
+        "readout": (D, D),
+    }
+
+    for name, expected_shape in expected_shapes.items():
+        if name not in params:
+            raise KeyError(f"missing mHC param: {name}")
+        if params[name].shape != expected_shape:
+            raise ValueError(
+                f"{name} has shape {params[name].shape}, expected {expected_shape}"
+            )
+
+
+def validate_mhc_inputs(x_streams, params, config):
+    validate_mhc_config(config)
+    if x_streams.ndim != 4:
+        raise ValueError(f"x_streams must be [B, T, N, D], got {x_streams.shape}")
+    if x_streams.shape[2] != config.num_streams:
+        raise ValueError(
+            f"x_streams stream dim is {x_streams.shape[2]}, "
+            f"expected num_streams={config.num_streams}"
+        )
+    if x_streams.shape[3] != config.model_dim:
+        raise ValueError(
+            f"x_streams model dim is {x_streams.shape[3]}, "
+            f"expected model_dim={config.model_dim}"
+        )
+    validate_mhc_params(params, config)
+
+
 def init_mhc_params(key, config):
+    validate_mhc_config(config)
     route_dim = config.num_streams * config.model_dim
     N = config.num_streams
     D = config.model_dim
@@ -113,6 +174,7 @@ def init_mhc_params(key, config):
 
 
 def mhc_block(x_streams, params, config, layer_fn):  
+    validate_mhc_inputs(x_streams, params, config)
 
     H_pre, H_post, H_res = generate_mhc_routes(x_streams, params, config)
     
@@ -131,6 +193,7 @@ def mhc_block(x_streams, params, config, layer_fn):
 
 
 def generate_mhc_routes(x_streams, params, config):  
+    validate_mhc_inputs(x_streams, params, config)
 
     B, T, N, D = x_streams.shape  
 
@@ -154,14 +217,14 @@ def generate_mhc_routes(x_streams, params, config):
 
 def sinkhorn(logits, iters, eps):  
 
-    H = jnp.exp(logits)  
+    H = jnp.exp(logits - jnp.max(logits, axis=(-2, -1), keepdims=True))
 
-    for i in range(iters):  
+    def step(_, H):
         H = H / (jnp.sum(H, axis=-2, keepdims=True) + eps)  
-
         H = H / (jnp.sum(H, axis=-1, keepdims=True) + eps)  
+        return H
 
-    return H  
+    return jax.lax.fori_loop(0, iters, step, H)
     
 
 def rms_norm(x, weights, eps):  
@@ -185,6 +248,8 @@ def mhc_readout(x_streams, params):
 
 
 def mhc_forward(x_streams, params, config):
+    validate_mhc_inputs(x_streams, params, config)
+
     def layer_fn(h):
         return mhc_test_layer(h, params, config)
 
@@ -194,6 +259,12 @@ def mhc_forward(x_streams, params, config):
 
 
 def mse_loss(params, x_streams, target, config):
+    validate_mhc_inputs(x_streams, params, config)
+    if target.shape != (x_streams.shape[0], x_streams.shape[1], config.model_dim):
+        raise ValueError(
+            f"target must be [B, T, D], got {target.shape}; "
+            f"expected {(x_streams.shape[0], x_streams.shape[1], config.model_dim)}"
+        )
     _, y = mhc_forward(x_streams, params, config)
     return jnp.mean(jnp.square(y - target))
 
@@ -273,4 +344,9 @@ if __name__ == "__main__":
         (2, 8, config.num_streams, config.model_dim),
     )
     np.testing.assert_equal(y.shape, (2, 8, config.model_dim))
+    np.testing.assert_equal(bool(jnp.all(jnp.isfinite(y_streams))), True)
+    np.testing.assert_equal(bool(jnp.all(jnp.isfinite(y))), True)
+    np.testing.assert_equal(bool(jnp.all(jnp.isfinite(H_res))), True)
+    np.testing.assert_allclose(row_error, 0.0, atol=1e-4, rtol=0.0)
+    np.testing.assert_allclose(col_error, 0.0, atol=1e-4, rtol=0.0)
 

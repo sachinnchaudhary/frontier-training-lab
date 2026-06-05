@@ -515,6 +515,80 @@ def triton_deepseek_moe_combine_backward(
     return drouter_logits, dexpert_outputs, dshared_out
 
 
+class _DeepSeekMoECombineFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, router_logits, expert_outputs, shared_out, top_k, block_d):
+        out, top_indices, router_weights = triton_deepseek_moe_combine(
+            router_logits,
+            expert_outputs,
+            shared_out,
+            top_k=top_k,
+            block_d=block_d,
+        )
+
+        ctx.save_for_backward(
+            router_logits,
+            expert_outputs,
+            shared_out,
+            top_indices,
+            router_weights,
+        )
+        ctx.top_k = top_k
+        ctx.block_d = block_d
+
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        (
+            router_logits,
+            expert_outputs,
+            shared_out,
+            top_indices,
+            router_weights,
+        ) = ctx.saved_tensors
+
+        drouter_logits, dexpert_outputs, dshared_out = triton_deepseek_moe_combine_backward(
+            router_logits,
+            expert_outputs,
+            shared_out,
+            dout,
+            top_indices,
+            router_weights,
+            top_k=ctx.top_k,
+            block_d=ctx.block_d,
+        )
+
+        return drouter_logits, dexpert_outputs, dshared_out, None, None
+
+
+def deepseek_moe_combine_autograd(
+    router_logits,
+    expert_outputs,
+    shared_out,
+    top_k=2,
+    block_d=128,
+):
+    """
+    Autograd-enabled Triton MoE combine.
+
+    router_logits:  [N, E]
+    expert_outputs: [N, E, D]
+    shared_out:     [N, D]
+
+    returns:
+      out: [N, D]
+    """
+
+    return _DeepSeekMoECombineFunction.apply(
+        router_logits,
+        expert_outputs,
+        shared_out,
+        top_k,
+        block_d,
+    )
+
+
 def benchmark(fn, *args, warmup=10, iters=100):
     def consume(out):
         if isinstance(out, tuple):
@@ -629,6 +703,38 @@ if __name__  == "__main__":
     print("drouter error:", (drouter_ref - drouter_tri).abs().max())
     print("dexpert error:", (dexpert_ref - dexpert_tri).abs().max())
     print("dshared error:", (dshared_ref - dshared_tri).abs().max())
+
+    print("\nautograd check")
+    router_ref = router_logits.detach().clone().requires_grad_(True)
+    expert_ref = expert_outputs.detach().clone().requires_grad_(True)
+    shared_ref = shared_out.detach().clone().requires_grad_(True)
+
+    out_ref, _, _ = torch_deepseek_moe_combine_ref(
+        router_ref,
+        expert_ref,
+        shared_ref,
+        top_k,
+    )
+    grad_out = torch.randn_like(out_ref)
+    (out_ref * grad_out).sum().backward()
+
+    router_tri = router_logits.detach().clone().requires_grad_(True)
+    expert_tri = expert_outputs.detach().clone().requires_grad_(True)
+    shared_tri = shared_out.detach().clone().requires_grad_(True)
+
+    out_tri_autograd = deepseek_moe_combine_autograd(
+        router_tri,
+        expert_tri,
+        shared_tri,
+        top_k=top_k,
+        block_d=4,
+    )
+    (out_tri_autograd * grad_out).sum().backward()
+
+    print("autograd out error:", (out_ref - out_tri_autograd).abs().max())
+    print("autograd router grad error:", (router_ref.grad - router_tri.grad).abs().max())
+    print("autograd expert grad error:", (expert_ref.grad - expert_tri.grad).abs().max())
+    print("autograd shared grad error:", (shared_ref.grad - shared_tri.grad).abs().max())
 
     print("\nbenchmark")
     for N in [512, 2048, 4096]:

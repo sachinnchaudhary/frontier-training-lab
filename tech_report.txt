@@ -1,72 +1,28 @@
 Frontier Training Lab Technical Report
 Date: 2026-06-02
 
-Scope
+
+Idea: 
+this repo contain not just educational implementation alones but it has advanced architectures, kernels and training runs with experiements.  Majority of things ran in Nvidia geforce rtx 2050 and some experiments ran on Nvidia 4090. 
+ 
+
+Essence
 =====
 
 This report summarizes the work completed so far in the repository, from the
 first Triton FlashAttention implementation through the JAX reference
 architectures, JAX training setup, experiment runners, correctness cleanups, and
 the first profiling results on an NVIDIA GeForce RTX 2050.
+(it also has some standard pytorch training scripts and some standard attention variant with others like gqa and sliding window.)
 
-The current stage is reference implementation plus first-pass profiling. The
-next stage is targeted optimization based on measured bottlenecks, not writing
-custom kernels blindly.
-
-
-1. Baseline Context
-===================
-
-The original PyTorch baseline training setup is in model/training.py, with
-notes captured in baseline run.txt.
-
-Baseline run notes:
-- Device: CUDA.
-- Batch size: 32.
-- Sequence length: 128.
-- Learning rate: 3e-4.
-- Actual vocab size: 4204.
-- Model size: 1,459,820 trainable parameters.
-- Warm throughput was usually around 70k-78k tokens/sec.
-
-Selected log observations:
-- Step 0: train_loss 8.4833, val_loss 8.4895.
-- Step 150: train_loss 5.6951, val_loss 7.3093.
-- One-batch overfit dropped train loss from about 8.44 to 0.0012, while
-  validation rose to about 9.05.
-
-Interpretation:
-- The tokenizer/data path was functional.
-- The model could memorize a fixed batch, so gradients and parameter updates
-  were working.
-- Validation loss rising during one-batch overfit was expected and confirmed
-  overfitting behavior.
+it has implementations + experiments + training runs + profillng and then kernels designed specifically to those bottlenecks. 
+so its not just discrete implementations of kernels but its otpimization in real sense.  
+figures out that kimi triangular solve is bottleneck and got speedup: 2.28x  
+mhc also hase lot of small ops apart from GEMM gaves also speedup: speedup=13.79x
+and others kernels are deepseek_moe.  
 
 
-2. Triton FlashAttention Work
-=============================
-
-File:
-- kernels/flash_attention.py
-
-Implemented:
-- Forward-only scaled dot-product attention in Triton.
-- Causal masking.
-- Online softmax with running max and running denominator.
-- LSE/log-sum-exp storage for backward.
-- Delta kernel for dO * O reduction.
-- dQ kernel.
-- dK/dV kernel.
-- PyTorch autograd wrapper using torch.autograd.Function.
-
-Status:
-- Functional educational Triton implementation.
-- Not yet benchmarked as a production kernel.
-- Future work should compare it against torch attention/flash attention under
-  controlled shapes.
-
-
-3. JAX Reference Implementations
+1. Implementations + training runs.
 ================================
 
 The repo now contains several JAX architecture references:
@@ -262,33 +218,20 @@ Purpose:
   some hybrid.
 
 
-5. Experiment Runners
-=====================
 
-Folder:
-- experiment/
-
-Added JAX experiment runners:
-- experiment/deepseek_mla_latent_sweep/run.py
-  - MLA latent_dim sweep plus MHA reference.
-- experiment/kimi_deltanet_memory_sweep/run.py
-  - state/key/value dim sweep.
-  - chunk size sweep.
-  - gate type sweep.
-- experiment/deepseek_sparse_topk_sweep/run.py
-  - sparse attention top_k sweep.
-- experiment/csa_hca_compression_sweep/run.py
-  - CSA compress rate and HCA compress rate sweep.
-- experiment/mhc_depth_scaling_sweep/run.py
-  - ordinary residual vs mHC residual across 4/8/12 layers.
-
-Goal:
-- Turn architecture ideas into repeatable runs.
-- Save logs and JSON summaries.
-- Avoid mixing experiment-specific code into jax_training/train.py.
+2. Experiments.  
+===========================
+  
 
 
-6. Profiling Infrastructure
+
+
+
+
+
+
+
+3. Profiling Infrastructure
 ===========================
 
 Files:
@@ -406,7 +349,8 @@ Medium-preset interpretation:
   pressure at medium.
 
 
-9. Current Bottleneck Ranking
+
+Current Bottleneck Ranking from profiling. 
 =============================
 
 Highest-priority bottleneck:
@@ -428,43 +372,14 @@ Third-priority:
    - Runtime is currently competitive, but algorithmic sparsity is limited by
      dense indexer scoring [B, T, T, index_heads].
 
-Promising path:
-4. CSA/HCA
-   - CSA has good train-time behavior at T=256.
-   - HCA has good forward behavior.
-   - Hybrid is more expensive but expected because it combines two paths.
 
 
-10. Lessons Learned
-===================
 
-JAX reference implementation lessons:
-- JAX forces explicit math:
-  - params are pytrees
-  - RNG is explicit
-  - loss/grad/update are explicit
-  - shape assumptions must be written down
-- This makes it good for algorithmic research but less hidden than PyTorch.
+kernels.  
+========
 
-Profiling lessons:
-- JAX execution is async, so block_until_ready is mandatory.
-- First call includes compilation; steady-state timing must be measured after
-  warmup.
-- "More parallel" code is not automatically better:
-  - Kimi parallel is faster at small runtime but has severe compile pressure at
-    medium size.
-- Correctness cleanup exposed performance-relevant behavior:
-  - CSA block-start masking was faster-looking but causally wrong.
-  - block-end masking required safe softmax for early tokens.
 
-Kernel lessons so far:
-- Custom kernels should be justified by measured bottlenecks.
-- Current first likely kernel candidate is Kimi parallel chunkwise, not because
-  it is interesting, but because profiling shows it is the major bottleneck.
-- CSA/HCA do not yet demand kernels at these sizes; they should first be scaled
-  and profiled further.
-
-Kimi triangular solve Triton prototype:
+====>  Kimi triangular solve Triton:
 - Implemented a standalone PyTorch/Triton triangular solve kernel for the Kimi
   vector-gated correction solve.
 - Mathematical target:
@@ -518,7 +433,7 @@ Kimi triangular solve Triton prototype:
     - A.grad error around 1.4e-6.
     - U.grad error around 7.2e-7.
 
-mHC route/merge Triton prototypes:
+====> mHC route/merge Triton:
 - Split mHC around the natural framework boundary:
   - PyTorch/framework keeps GEMM-heavy routing projections and Layer_F.
   - Triton route/read kernel handles sigmoid, Sinkhorn-Knopp, and weighted
@@ -610,7 +525,8 @@ mHC route/merge Triton prototypes:
     - Best small/mid case: 5.87x.
     - Larger cases stayed positive, about 1.88x to 3.56x.
 
-DeepSeekMoE combine Triton prototype:
+====> DeepSeekMoE combine Triton:
+
 - Added a non-GEMM MoE combine kernel in kernels/deepseek_moe_combine.py.
 - Scope:
   - Framework/PyTorch still owns expert MLP GEMMs.
@@ -647,41 +563,111 @@ DeepSeekMoE combine Triton prototype:
     combine, and backward scatter into a small number of kernels.
 
 
-11. Next Steps
-==============
 
-Recommended immediate profiling changes:
-- Do not run all models at medium including Kimi parallel on RTX 2050.
-- Add profiler groups:
-  - core: mhla, sparse, csa, hca, csa_hca, mhc
-  - kimi: kimi_stepwise, kimi_chunkwise, kimi_parallel
-- Run Kimi in separate reduced presets.
 
-Recommended Kimi profiling plan:
-- gate_type: scalar vs vector
-- chunk_size: 8, 16, 32
-- key_dim/value_dim: 32, 64, 128
-- compare:
-  - stepwise
-  - chunk-scan
-  - parallel chunkwise
 
-Recommended CSA/HCA profiling plan:
-- T = 128, 256, 512 if GPU memory allows.
-- csa_compress_rate = 8, 16, 32.
-- hca_compress_rate = 64, 96, 128.
-- local_window_size = 64, 96, 128.
 
-Recommended sparse profiling plan:
-- top_k = 4, 8, 16, 32.
-- T = 128, 256, 512.
-- Track whether dense indexer scoring dominates before final sparse attention.
 
-Recommended mHC profiling plan:
-- num_streams = 2, 4, 6, 8.
-- sinkhorn_iters = 4, 8, 12, 20.
-- profile stacked depth, not just one block.
 
-Recommended implementation next step:
-- Add profiler model groups and Kimi-specific presets.
-- Then run sequence-length scaling with core models first.
+
+
+1. Baseline Context
+===================
+
+The original PyTorch baseline training setup is in model/training.py, with
+notes captured in baseline run.txt.
+
+Baseline run notes:
+- Device: CUDA.
+- Batch size: 32.
+- Sequence length: 128.
+- Learning rate: 3e-4.
+- Actual vocab size: 4204.
+- Model size: 1,459,820 trainable parameters.
+- Warm throughput was usually around 70k-78k tokens/sec.
+
+Selected log observations:
+- Step 0: train_loss 8.4833, val_loss 8.4895.
+- Step 150: train_loss 5.6951, val_loss 7.3093.
+- One-batch overfit dropped train loss from about 8.44 to 0.0012, while
+  validation rose to about 9.05.
+
+
+
+2. Triton FlashAttention Work
+=============================
+
+File:
+- kernels/flash_attention.py
+
+Implemented:
+- Forward-only scaled dot-product attention in Triton.
+- Causal masking.
+- Online softmax with running max and running denominator.
+- LSE/log-sum-exp storage for backward.
+- Delta kernel for dO * O reduction.
+- dQ kernel.
+- dK/dV kernel.
+- PyTorch autograd wrapper using torch.autograd.Function.
+
+
+
+
+
+5. Experiment Runners
+=====================
+
+Folder:
+- experiment/
+
+Added JAX experiment runners:
+- experiment/deepseek_mla_latent_sweep/run.py
+  - MLA latent_dim sweep plus MHA reference.
+- experiment/kimi_deltanet_memory_sweep/run.py
+  - state/key/value dim sweep.
+  - chunk size sweep.
+  - gate type sweep.
+- experiment/deepseek_sparse_topk_sweep/run.py
+  - sparse attention top_k sweep.
+- experiment/csa_hca_compression_sweep/run.py
+  - CSA compress rate and HCA compress rate sweep.
+- experiment/mhc_depth_scaling_sweep/run.py
+  - ordinary residual vs mHC residual across 4/8/12 layers.
+
+Goal:
+- Turn architecture ideas into repeatable runs.
+- Save logs and JSON summaries.
+- Avoid mixing experiment-specific code into jax_training/train.py.
+
+
+
+
+10. Lessons Learned
+===================
+
+JAX reference implementation lessons:
+- JAX forces explicit math:
+  - params are pytrees
+  - RNG is explicit
+  - loss/grad/update are explicit
+  - shape assumptions must be written down
+- This makes it good for algorithmic research but less hidden than PyTorch.
+
+Profiling lessons:
+- JAX execution is async, so block_until_ready is mandatory.
+- First call includes compilation; steady-state timing must be measured after
+  warmup.
+- "More parallel" code is not automatically better:
+  - Kimi parallel is faster at small runtime but has severe compile pressure at
+    medium size.
+- Correctness cleanup exposed performance-relevant behavior:
+  - CSA block-start masking was faster-looking but causally wrong.
+  - block-end masking required safe softmax for early tokens.
+
+Kernel lessons so far:
+- Custom kernels should be justified by measured bottlenecks.
+- Current first likely kernel candidate is Kimi parallel chunkwise, not because
+  it is interesting, but because profiling shows it is the major bottleneck.
+- CSA/HCA do not yet demand kernels at these sizes; they should first be scaled
+  and profiled further.
+

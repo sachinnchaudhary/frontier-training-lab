@@ -7,36 +7,26 @@ beyond words with clean intuition.
 - care  
 - falsifying 
 
+there is one more thing which i want to ask. till now through this repo i implemented architecture and i trained models and did some experiments. i also wrote kernels.  
+i dont know but i not find myself in specific problems i liked all this things. 
+one realization i have is i want to do "research which scales" i am interested in research engineering(innnovation) i love to get intuition of this architectures and at the same time it gives me equal pleasure to see it scale on multiple gpus. i cant define my boundaries like i want to work on "this problem x like lets say tokenizers" or "continual learning" like that i just dont know but love to be on sweet poing of research and engineering. 
+one thing which i feel is "i want to train frontier models across data centers and its not like pure engiener but i have clear curiosity for intuition of ideas and want to do that as well" 
+like if i ask myself question that "what contribution you want to make" 
+i can clearly say i want to train frontier models(deep learning acorss data centers) 
+and i eqully love to innovate things and be participating in it. when i read papers like deepseek-v3 or v4 or saw those innovation of attention architectures i loved those things.(being between research and engineering you see) i dont want to be somone who just writes papers and design experiments alone but its like okey we need to think about this newer way of attention then i love that which is no pure theory but somethign which scale and people can feel that. 
+so its like i want to think about such innovative ideas and also want to be part of someone who scales them across thousand and million of gpus.  
 
 
 
 
-attention/optimizer experiments(various attention architecture with optims) 
- - deepseek attentions type, with sparse one. 
- - muon, aurora.  
- - mhc residuals(https://chatgpt.com/c/699a9f16-b4bc-83aa-b0e7-57d6df56e502), att residuals   
-profiling(then comes more on hardware optim side)
-measured bottleneck
-custom kernel
+
+- optimization over this things(understand jax deeply from training too), find out bottleneck and write kernels for it.  
 
 
 
-exps: 
-- mla deepseek 
-- deltanet kimi 
-- sparse att deepseek 
-- Mhc residuals: 
-   - LayerNorm vs RMSNorm
-   - pre-norm vs post-norm
-   - residual scaling
-   - parallel residual
-   - depth: 4, 6, 8, 12 layers if hardware allows
--profilling and kernels
-- quantization  
-- kv cache  
 
 
-
+deepseek innovations: https://chatgpt.com/c/699a9f16-b4bc-83aa-b0e7-57d6df56e502
 
 1. Model research layer
    Architecture, optimizer, objective, residuals, attention variants.
@@ -66,19 +56,67 @@ paper to internalize:
  deepseek v4: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf
  
  
-jax implementations + kernels:  
- 
- - deepseek csa and hca deterministic:(tilelang)   
- - mhc residuals (tilelang) 
- 
-
 
 things neeed to be done:    
  - writing kernels in tilelang/triton. 
  - reinforce, ppo, grpo, cispo and policy gradient methods.  
  - their training scripts and entire architecture in repo
   
- 
+
+
+ """
+JAX notes: 
+JIT traces computation by shape/dtype, compiles it, and reuses it for same signatures.
+Vectorization means express the computation over arrays/batches instead of Python loops.
+JAX transformations compose: vmap, grad, jit.
+Params change by value every step, but no recompile if shape/dtype/tree structure stays same.
+
+vmap = batch independent computations
+scan = recurrent/dependent loops
+tree_util = update nested params/states
+jit = compile whole train step
+pmap/pjit = distribute train step over multiple GPUs
+
+tree_util: 
+ params = {
+    "blocks": (
+        {
+            "attn": {
+                "q_proj": array,
+                "k_proj": array,
+            },
+            "moe": {
+                "router": array,
+            },
+        },
+        ...
+    ),
+    "lm_head": array,
+}
+
+jit:
+  compile this function
+
+grad:
+  differentiate this function
+
+vmap:
+  add a batch axis to this function
+
+scan:
+  turn a recurrent loop into one compiled loop
+
+pmap:
+  run this function across devices with replicated params
+
+pjit:
+  run this function across devices with explicit array sharding
+
+tree_util:
+  manipulate nested params/grads/state like one mathematical object
+
+"""
+
 
 
 
@@ -107,9 +145,21 @@ exps command:
 
  
 
+okey so where there are much of memory movement with lot of operations then its better to have custom kernel(but this increase value for more of like fused kernel instead of one discrete. look at flash attention i think its just trying to fuse entire thing in one kernel so read write can be saved which is becoming costly in standard attention kernels because matmul kernle is different then softmax one)
+when operations are more of like system and newly innovated beyon GEMM then i think kernels become inevitable too just like you said DeepSeek-style kernels often care about:
+FP8 layout
+block scale
+expert routing
+compressed KV cache layout which jax/xla not provide.
 
+Custom kernels are valuable when we need to control the memory schedule, not just the math. 
+They become inevitable when the architecture introduces non-standard data movement:
+compressed cache layouts, sparse routing, FP8 block scales, expert dispatch, recurrent chunk states.
 
 
 
 
    
+  
+
+

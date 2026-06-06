@@ -220,6 +220,7 @@ __marimo__/
 
 #files  
 notes.txt  
+/post-training
 
 # local data/cache artifacts
 .triton_cache/

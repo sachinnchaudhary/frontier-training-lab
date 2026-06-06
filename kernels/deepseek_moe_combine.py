@@ -114,6 +114,89 @@ def deepseek_moe_layer(x, W_router, routed_experts, shared_experts, top_k):
     return output  
 
 
+t1: [ex1, ex2, ex3,ex4]
+t2: [ex1, ex2, ex3,ex4]     [N, E]  
+t3: [ex1, ex2, ex3,ex4]
+t4: [ex1, ex2, ex3,ex4]
+
+top_values = 
+t1: [ex1, ex2]
+t2: [ex1, ex2]     [N, top_k]    
+t3: [ex1, ex2]
+t4: [ex1, ex2]
+
+top_indices =  
+
+t1: [0, 2]  
+t2: [3, 1] 
+t3: [4, 1]  
+t4: [1, 0]
+
+
+prob =  softmax(  
+
+top_values = 
+t1: [ex1, ex2]
+t2: [ex1, ex2]     [N, top_k]    
+t3: [ex1, ex2]
+t4: [ex1, ex2]
+
+
+)
+
+routed_out = [T, D] with zeros.  
+
+for exp in range(E): here it would be 0 to 4.   
+
+exp= 0   
+
+ token_selected = top_indices == expert_id  
+ t1: [0, 2]           [True, False] 
+ t2: [3, 1]   --->    [False, false] 
+ t3: [4, 1]           [false, false]   
+ t4: [1, 0]           [false, true] 
+      
+token_mask = [true, false, false,true] #token_mask = any(token_selected, dim=-1)   
+   
+tokens_for_expert = x[token_mask] makes 
+[t1, t4] ---> from [t1,t2, t3, t4]
+
+routed_experts = [FFN_0, FFN_1, FFN_2, FFN_3, FFN_4]   ---> where FFN_n: W1 [D, 4D], W2 [4D, D]
+
+expert_out = routed_experts[expert_id](tokens_for_expert)   
+   t1 [D] → W1 → relu → W2 → FFN_0(t1) [D]
+   t4 [D] → W1 → relu → W2 → FFN_0(t4) [D]
+
+expert_out = [FFN_0(t1),   shape [2, D]
+              FFN_0(t4)]
+
+              
+selected_slots = token_selected[token_mask].float()  
+   selected_slots =  
+      tok1: [1, 0]  
+      tok4: [0, 1]  
+
+ expert_weight = sum(
+            router_weights[token_mask] * selected_slots,          
+            dim=-1,
+        )                                   
+        router_weights[token_mask] =  
+          token 1: [0.70, 0.30] 
+          token 4: [0.80, 0.20]
+
+  router weights * selected_slots =  
+     token 1: [0.70, 0.30] * [1, 0] = [0.70, 0.0]
+     token 4: [0.80, 0.20] * [0, 1] = [0.0, 0.20]
+
+expert_weight =
+token 0: 0.70
+token 3: 0.20
+
+routed_out[token_mask] += expert_weight[:, None] * expert_out  
+  routed_out[0] += 0.70 * expert_out                              
+  routed_out[3] += 0.80 * expert_0(x3)
+
+output = shared_out + routed_out  
 
 """
 

@@ -32,6 +32,9 @@ def parse_args():
         help="Top-k run ids to launch.",
     )
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--seq-len", type=int, default=512)
+    parser.add_argument("--eval-batches", type=int, default=None)
     parser.add_argument("--max-encoded-tokens", type=int, default=150_000_000)
     return parser.parse_args()
 
@@ -44,14 +47,15 @@ def build_train_config(args, run_id):
     top_k = top_k_from_run_id(run_id)
     if args.mode == "pilot":
         max_steps = 3_000
-        eval_batches = 10
+        default_eval_batches = 10
         warmup_steps = 300
     else:
         max_steps = 30_000
-        eval_batches = 20
+        default_eval_batches = 20
         warmup_steps = 1_000
 
-    seq_len = 512
+    seq_len = args.seq_len
+    eval_batches = args.eval_batches or default_eval_batches
     run_name = f"deepseek_sparse_topk{top_k}_muon_768d_6l_seq{seq_len}"
     log_path = f"experiment/deepseek_sparse_topk_sweep/{args.mode}/{run_id}/summary.jsonl"
     return replace(
@@ -62,7 +66,7 @@ def build_train_config(args, run_id):
         run_name=run_name,
         log_path=log_path,
         max_encoded_tokens=args.max_encoded_tokens,
-        batch_size=8,
+        batch_size=args.batch_size,
         seq_len=seq_len,
         max_steps=max_steps,
         log_interval=10,

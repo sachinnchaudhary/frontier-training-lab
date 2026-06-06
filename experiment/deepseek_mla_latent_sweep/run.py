@@ -31,7 +31,7 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--max-steps", type=int, default=30_000)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--max-encoded-tokens", type=int, default=150_000_000)
     parser.add_argument("--log-interval", type=int, default=10)

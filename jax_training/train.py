@@ -32,7 +32,7 @@ class TrainConfig:
     seed: int = 1337
     dataset_name: str = "parameter_golf_sp1024"
     max_encoded_tokens: int = 150_000_000
-    batch_size: int = 8
+    batch_size: int = 4
     seq_len: int = 512
     max_steps: int = 30_000
     log_interval: int = 10
@@ -278,7 +278,7 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--max-steps", type=int, default=30_000)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--max-encoded-tokens", type=int, default=150_000_000)
     parser.add_argument("--log-interval", type=int, default=10)

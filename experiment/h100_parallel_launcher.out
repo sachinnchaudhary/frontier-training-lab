@@ -1,0 +1,173 @@
+nohup: ignoring input
+jobs=84
+gpus=0, 1, 2, 3, 4, 5, 6, 7
+[gpu 0] start 001 jax_training_default_mhla
+[gpu 1] start 002 mla_small
+[gpu 3] start 004 mla_large
+[gpu 2] start 003 mla_medium
+[gpu 4] start 005 mla_mha
+[gpu 5] start 006 kimi_pilot_state32_chunk8_nogate
+[gpu 6] start 007 kimi_pilot_state32_chunk8_scalar
+[gpu 7] start 008 kimi_pilot_state32_chunk8_vector
+[gpu 6] done 007 kimi_pilot_state32_chunk8_scalar elapsed=0.12h
+[gpu 6] start 009 kimi_pilot_state32_chunk16_nogate
+[gpu 5] done 006 kimi_pilot_state32_chunk8_nogate elapsed=0.13h
+[gpu 5] start 010 kimi_pilot_state32_chunk16_scalar
+[gpu 7] done 008 kimi_pilot_state32_chunk8_vector elapsed=0.13h
+[gpu 7] start 011 kimi_pilot_state32_chunk16_vector
+[gpu 6] done 009 kimi_pilot_state32_chunk16_nogate elapsed=0.08h
+[gpu 6] start 012 kimi_pilot_state32_chunk32_nogate
+[gpu 5] done 010 kimi_pilot_state32_chunk16_scalar elapsed=0.08h
+[gpu 5] start 013 kimi_pilot_state32_chunk32_scalar
+[gpu 7] done 011 kimi_pilot_state32_chunk16_vector elapsed=0.09h
+[gpu 7] start 014 kimi_pilot_state32_chunk32_vector
+[gpu 6] done 012 kimi_pilot_state32_chunk32_nogate elapsed=0.07h
+[gpu 6] start 015 kimi_pilot_state32_chunk64_nogate
+[gpu 5] done 013 kimi_pilot_state32_chunk32_scalar elapsed=0.07h
+[gpu 5] start 016 kimi_pilot_state32_chunk64_scalar
+[gpu 7] done 014 kimi_pilot_state32_chunk32_vector elapsed=0.07h
+[gpu 7] start 017 kimi_pilot_state32_chunk64_vector
+[gpu 6] done 015 kimi_pilot_state32_chunk64_nogate elapsed=0.06h
+[gpu 6] start 018 kimi_pilot_state32_chunk128_nogate
+[gpu 5] done 016 kimi_pilot_state32_chunk64_scalar elapsed=0.06h
+[gpu 5] start 019 kimi_pilot_state32_chunk128_scalar
+[gpu 7] done 017 kimi_pilot_state32_chunk64_vector elapsed=0.06h
+[gpu 7] start 020 kimi_pilot_state32_chunk128_vector
+[gpu 6] done 018 kimi_pilot_state32_chunk128_nogate elapsed=0.06h
+[gpu 6] start 021 kimi_pilot_state64_chunk8_nogate
+[gpu 5] done 019 kimi_pilot_state32_chunk128_scalar elapsed=0.06h
+[gpu 5] start 022 kimi_pilot_state64_chunk8_scalar
+[gpu 7] done 020 kimi_pilot_state32_chunk128_vector elapsed=0.06h
+[gpu 7] start 023 kimi_pilot_state64_chunk8_vector
+[gpu 6] done 021 kimi_pilot_state64_chunk8_nogate elapsed=0.12h
+[gpu 6] start 024 kimi_pilot_state64_chunk16_nogate
+[gpu 5] done 022 kimi_pilot_state64_chunk8_scalar elapsed=0.12h
+[gpu 5] start 025 kimi_pilot_state64_chunk16_scalar
+[gpu 7] done 023 kimi_pilot_state64_chunk8_vector elapsed=0.13h
+[gpu 7] start 026 kimi_pilot_state64_chunk16_vector
+[gpu 6] done 024 kimi_pilot_state64_chunk16_nogate elapsed=0.08h
+[gpu 6] start 027 kimi_pilot_state64_chunk32_nogate
+[gpu 5] done 025 kimi_pilot_state64_chunk16_scalar elapsed=0.09h
+[gpu 5] start 028 kimi_pilot_state64_chunk32_scalar
+[gpu 7] done 026 kimi_pilot_state64_chunk16_vector elapsed=0.09h
+[gpu 7] start 029 kimi_pilot_state64_chunk32_vector
+[gpu 6] done 027 kimi_pilot_state64_chunk32_nogate elapsed=0.07h
+[gpu 6] start 030 kimi_pilot_state64_chunk64_nogate
+[gpu 5] done 028 kimi_pilot_state64_chunk32_scalar elapsed=0.07h
+[gpu 5] start 031 kimi_pilot_state64_chunk64_scalar
+[gpu 7] done 029 kimi_pilot_state64_chunk32_vector elapsed=0.07h
+[gpu 7] start 032 kimi_pilot_state64_chunk64_vector
+[gpu 6] done 030 kimi_pilot_state64_chunk64_nogate elapsed=0.06h
+[gpu 6] start 033 kimi_pilot_state64_chunk128_nogate
+[gpu 5] done 031 kimi_pilot_state64_chunk64_scalar elapsed=0.06h
+[gpu 5] start 034 kimi_pilot_state64_chunk128_scalar
+[gpu 7] done 032 kimi_pilot_state64_chunk64_vector elapsed=0.06h
+[gpu 7] start 035 kimi_pilot_state64_chunk128_vector
+[gpu 6] done 033 kimi_pilot_state64_chunk128_nogate elapsed=0.06h
+[gpu 6] start 036 kimi_pilot_state128_chunk8_nogate
+[gpu 5] done 034 kimi_pilot_state64_chunk128_scalar elapsed=0.06h
+[gpu 5] start 037 kimi_pilot_state128_chunk8_scalar
+[gpu 7] done 035 kimi_pilot_state64_chunk128_vector elapsed=0.06h
+[gpu 7] start 038 kimi_pilot_state128_chunk8_vector
+[gpu 6] done 036 kimi_pilot_state128_chunk8_nogate elapsed=0.12h
+[gpu 6] start 039 kimi_pilot_state128_chunk16_nogate
+[gpu 5] done 037 kimi_pilot_state128_chunk8_scalar elapsed=0.13h
+[gpu 5] start 040 kimi_pilot_state128_chunk16_scalar
+[gpu 7] done 038 kimi_pilot_state128_chunk8_vector elapsed=0.13h
+[gpu 7] start 041 kimi_pilot_state128_chunk16_vector
+[gpu 6] done 039 kimi_pilot_state128_chunk16_nogate elapsed=0.09h
+[gpu 6] start 042 kimi_pilot_state128_chunk32_nogate
+[gpu 5] done 040 kimi_pilot_state128_chunk16_scalar elapsed=0.09h
+[gpu 5] start 043 kimi_pilot_state128_chunk32_scalar
+[gpu 7] done 041 kimi_pilot_state128_chunk16_vector elapsed=0.09h
+[gpu 7] start 044 kimi_pilot_state128_chunk32_vector
+[gpu 6] done 042 kimi_pilot_state128_chunk32_nogate elapsed=0.08h
+[gpu 6] start 045 kimi_pilot_state128_chunk64_nogate
+[gpu 5] done 043 kimi_pilot_state128_chunk32_scalar elapsed=0.08h
+[gpu 5] start 046 kimi_pilot_state128_chunk64_scalar
+[gpu 7] done 044 kimi_pilot_state128_chunk32_vector elapsed=0.08h
+[gpu 7] start 047 kimi_pilot_state128_chunk64_vector
+[gpu 6] done 045 kimi_pilot_state128_chunk64_nogate elapsed=0.07h
+[gpu 6] start 048 kimi_pilot_state128_chunk128_nogate
+[gpu 5] done 046 kimi_pilot_state128_chunk64_scalar elapsed=0.07h
+[gpu 5] start 049 kimi_pilot_state128_chunk128_scalar
+[gpu 4] done 005 mla_mha elapsed=1.18h
+[gpu 4] start 050 kimi_pilot_state128_chunk128_vector
+[gpu 7] done 047 kimi_pilot_state128_chunk64_vector elapsed=0.07h
+[gpu 7] start 051 kimi_pilot_state256_chunk8_nogate
+[gpu 0] done 001 jax_training_default_mhla elapsed=1.22h
+[gpu 0] start 052 kimi_pilot_state256_chunk8_scalar
+[gpu 1] done 002 mla_small elapsed=1.22h
+[gpu 1] start 053 kimi_pilot_state256_chunk8_vector
+[gpu 6] done 048 kimi_pilot_state128_chunk128_nogate elapsed=0.08h
+[gpu 6] start 054 kimi_pilot_state256_chunk16_nogate
+[gpu 2] done 003 mla_medium elapsed=1.23h
+[gpu 2] start 055 kimi_pilot_state256_chunk16_scalar
+[gpu 5] done 049 kimi_pilot_state128_chunk128_scalar elapsed=0.08h
+[gpu 5] start 056 kimi_pilot_state256_chunk16_vector
+[gpu 3] done 004 mla_large elapsed=1.25h
+[gpu 3] start 057 kimi_pilot_state256_chunk32_nogate
+[gpu 4] done 050 kimi_pilot_state128_chunk128_vector elapsed=0.09h
+[gpu 4] start 058 kimi_pilot_state256_chunk32_scalar
+[gpu 7] done 051 kimi_pilot_state256_chunk8_nogate elapsed=0.12h
+[gpu 7] start 059 kimi_pilot_state256_chunk32_vector
+[gpu 6] done 054 kimi_pilot_state256_chunk16_nogate elapsed=0.11h
+[gpu 6] start 060 kimi_pilot_state256_chunk64_nogate
+[gpu 2] done 055 kimi_pilot_state256_chunk16_scalar elapsed=0.11h
+[gpu 2] start 061 kimi_pilot_state256_chunk64_scalar
+[gpu 0] done 052 kimi_pilot_state256_chunk8_scalar elapsed=0.13h
+[gpu 0] start 062 kimi_pilot_state256_chunk64_vector
+[gpu 3] done 057 kimi_pilot_state256_chunk32_nogate elapsed=0.10h
+[gpu 3] start 063 kimi_pilot_state256_chunk128_nogate
+[gpu 1] done 053 kimi_pilot_state256_chunk8_vector elapsed=0.14h
+[gpu 1] start 064 kimi_pilot_state256_chunk128_scalar
+[gpu 4] done 058 kimi_pilot_state256_chunk32_scalar elapsed=0.10h
+[gpu 4] start 065 kimi_pilot_state256_chunk128_vector
+[gpu 5] done 056 kimi_pilot_state256_chunk16_vector elapsed=0.13h
+[gpu 5] start 066 sparse_full_topk4
+[gpu 6] done 060 kimi_pilot_state256_chunk64_nogate elapsed=0.10h
+[gpu 6] start 067 sparse_full_topk8
+[gpu 7] done 059 kimi_pilot_state256_chunk32_vector elapsed=0.11h
+[gpu 7] start 068 sparse_full_topk16
+[gpu 2] done 061 kimi_pilot_state256_chunk64_scalar elapsed=0.10h
+[gpu 2] start 069 sparse_full_topk32
+[gpu 0] done 062 kimi_pilot_state256_chunk64_vector elapsed=0.11h
+[gpu 0] start 070 csa_hca_full_csa4_hca32
+[gpu 4] done 065 kimi_pilot_state256_chunk128_vector elapsed=0.16h
+[gpu 4] start 071 csa_hca_full_csa4_hca64
+[gpu 1] done 064 kimi_pilot_state256_chunk128_scalar elapsed=0.19h
+[gpu 1] start 072 csa_hca_full_csa4_hca128
+[gpu 3] done 063 kimi_pilot_state256_chunk128_nogate elapsed=0.22h
+[gpu 3] start 073 csa_hca_full_csa8_hca32
+[gpu 5] done 066 sparse_full_topk4 elapsed=1.23h
+[gpu 5] start 074 csa_hca_full_csa8_hca64
+[gpu 7] done 068 sparse_full_topk16 elapsed=1.23h
+[gpu 7] start 075 csa_hca_full_csa8_hca128
+[gpu 6] done 067 sparse_full_topk8 elapsed=1.23h
+[gpu 6] start 076 csa_hca_full_csa16_hca32
+[gpu 2] done 069 sparse_full_topk32 elapsed=1.24h
+[gpu 2] start 077 csa_hca_full_csa16_hca64
+[gpu 0] done 070 csa_hca_full_csa4_hca32 elapsed=1.40h
+[gpu 0] start 078 csa_hca_full_csa16_hca128
+[gpu 1] done 072 csa_hca_full_csa4_hca128 elapsed=1.38h
+[gpu 1] start 079 mhc_full_ordinary_l4
+[gpu 4] done 071 csa_hca_full_csa4_hca64 elapsed=1.41h
+[gpu 4] start 080 mhc_full_ordinary_l8
+[gpu 3] done 073 csa_hca_full_csa8_hca32 elapsed=1.39h
+[gpu 3] start 081 mhc_full_ordinary_l12
+[gpu 1] done 079 mhc_full_ordinary_l4 elapsed=0.74h
+[gpu 1] start 082 mhc_full_mhc_l4
+[gpu 5] done 074 csa_hca_full_csa8_hca64 elapsed=1.39h
+[gpu 5] start 083 mhc_full_mhc_l8
+[gpu 6] done 076 csa_hca_full_csa16_hca32 elapsed=1.38h
+[gpu 6] start 084 mhc_full_mhc_l12
+[gpu 7] done 075 csa_hca_full_csa8_hca128 elapsed=1.39h
+[gpu 2] done 077 csa_hca_full_csa16_hca64 elapsed=1.40h
+[gpu 0] done 078 csa_hca_full_csa16_hca128 elapsed=1.38h
+[gpu 1] done 082 mhc_full_mhc_l4 elapsed=0.75h
+[gpu 4] done 080 mhc_full_ordinary_l8 elapsed=1.63h
+[gpu 3] done 081 mhc_full_ordinary_l12 elapsed=2.57h
+[gpu 5] done 083 mhc_full_mhc_l8 elapsed=1.57h
+[gpu 6] done 084 mhc_full_mhc_l12 elapsed=2.67h
+finished all jobs successfully
+status=experiment/h100_parallel_logs/status.jsonl

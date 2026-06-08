@@ -22,12 +22,13 @@ mhc also hase lot of small ops apart from GEMM gaves also speedup: speedup=13.79
 and others kernels are deepseek_moe.  
 
 
-1. Implementations + training runs.
-================================
+
+Implementations + training runs.
+==========================
 
 The repo now contains several JAX architecture references:
 
-3.1 MHLA / MLA Attention + DeepSeekMoE
+1.1 MHLA / MLA Attention + DeepSeekMoE
 --------------------------------------
 
 File:
@@ -56,7 +57,7 @@ Important correctness result:
   smoke test.
 
 
-3.2 Kimi DeltaNet
+1.2 Kimi DeltaNet
 -----------------
 
 File:
@@ -87,7 +88,7 @@ Profiling result:
   medium preset causes severe XLA compile pressure.
 
 
-3.3 DeepSeek Sparse Attention
+1.3 DeepSeek Sparse Attention
 -----------------------------
 
 File:
@@ -122,7 +123,7 @@ Current limitation:
   scoring.
 
 
-3.4 DeepSeek CSA / HCA / Hybrid Attention
+1.4 DeepSeek CSA / HCA / Hybrid Attention
 -----------------------------------------
 
 File:
@@ -156,7 +157,7 @@ Profiling result:
 - CSA+HCA is roughly additive and slower than either alone.
 
 
-3.5 mHC Residual Highway
+1.5 mHC Residual Highway
 ------------------------
 
 File:
@@ -189,7 +190,7 @@ Profiling result:
   deeper before stacking many blocks.
 
 
-4. JAX Training Infrastructure
+JAX Training Infrastructure
 ==============================
 
 Folder:
@@ -219,19 +220,45 @@ Purpose:
 
 
 
-2. Experiments.  
+Experiments.  
 ===========================
   
+This repo have two tpyes of experiments one is standard pytorch and second one is jax advanced architectures.  
+
+Folder:
+- experiment/
+
+JAX experiment runners:
+- experiment/deepseek_mla_latent_sweep/run.py
+  - MLA latent_dim sweep plus MHA reference.
+- experiment/kimi_deltanet_memory_sweep/run.py
+  - state/key/value dim sweep.
+  - chunk size sweep.
+  - gate type sweep.
+- experiment/deepseek_sparse_topk_sweep/run.py
+  - sparse attention top_k sweep.
+- experiment/csa_hca_compression_sweep/run.py
+  - CSA compress rate and HCA compress rate sweep.
+- experiment/mhc_depth_scaling_sweep/run.py
+  - ordinary residual vs mHC residual across 4/8/12 layers.
+
+
+pytorch experiments runners:  
+-experiemnt/scaling_laws.py  
+  - reproducing scaling laws.   
+- experiement/optimizer_experiment.py  
+  - optimizer compare between adamw and muon.  
+- experiment/sliding_window_experiment.py  
+  - runnning various slidning window attention.  
+- experiment/gqa_experiment.py  
+  - various group-query size experiment.  
+- experiement/ffn_experiment.py  
+  - comparison between gelu and swiglu in transformer ffnetwork.   
 
 
 
 
-
-
-
-
-
-3. Profiling Infrastructure
+Profiling Infrastructure
 ===========================
 
 Files:
@@ -270,7 +297,7 @@ Correct JAX profiling rules used:
 - block_until_ready is used so async GPU execution does not corrupt timing.
 
 
-7. Profiling Results: Small Preset
+Profiling Results: Small Preset
 ==================================
 
 Small preset:
@@ -367,12 +394,6 @@ Second-priority bottleneck:
    - Not as bad as Kimi, but route generation + Sinkhorn + stream mixing will
      compound across layers.
 
-Third-priority:
-3. Sparse attention
-   - Runtime is currently competitive, but algorithmic sparsity is limited by
-     dense indexer scoring [B, T, T, index_heads].
-
-
 
 
 kernels.  
@@ -403,7 +424,7 @@ kernels.
     - N=128/512: Triton usually wins.
     - N=2048: vector Triton helps for C=16/32, loses for C=64.
     - N=8192: PyTorch is generally stronger.
-- Main lesson:
+- Obserevation:
   - The custom kernel improved memory behavior, not the sequential dependency.
   - The triangular dependency over chunk positions remains sequential.
   - A custom kernel has a useful operating region, but library kernels can win
@@ -475,7 +496,7 @@ kernels.
   - Best observed combined example:
     - N=512, S=4, D=512: about 13.7x speedup.
   - Larger S/D cases still showed meaningful speedups, commonly 3x-8x.
-- Main lesson:
+- Obserevation:
   - This is a high-value kernel target because it fuses awkward small-matrix
     routing, Sinkhorn normalization, and stream read/write operations while
     leaving large GEMMs in the framework.
@@ -586,13 +607,12 @@ Baseline run notes:
 - Model size: 1,459,820 trainable parameters.
 - Warm throughput was usually around 70k-78k tokens/sec.
 
-Selected log observations:
-- Step 0: train_loss 8.4833, val_loss 8.4895.
-- Step 150: train_loss 5.6951, val_loss 7.3093.
-- One-batch overfit dropped train loss from about 8.44 to 0.0012, while
-  validation rose to about 9.05.
 
-
+And then there is jax_training from which you can do training run with different architecture of jax.  
+python -m jax_training.train --architecture csa_hca_moe
+python -m jax_training.train --architecture kimi_deltanet_moe
+python -m jax_training.train --architecture deepseek_sparse_moe
+python -m jax_training.train --architecture deepseek_mhla_moe  
 
 2. Triton FlashAttention Work
 =============================
@@ -610,34 +630,6 @@ Implemented:
 - dK/dV kernel.
 - PyTorch autograd wrapper using torch.autograd.Function.
 
-
-
-
-
-5. Experiment Runners
-=====================
-
-Folder:
-- experiment/
-
-Added JAX experiment runners:
-- experiment/deepseek_mla_latent_sweep/run.py
-  - MLA latent_dim sweep plus MHA reference.
-- experiment/kimi_deltanet_memory_sweep/run.py
-  - state/key/value dim sweep.
-  - chunk size sweep.
-  - gate type sweep.
-- experiment/deepseek_sparse_topk_sweep/run.py
-  - sparse attention top_k sweep.
-- experiment/csa_hca_compression_sweep/run.py
-  - CSA compress rate and HCA compress rate sweep.
-- experiment/mhc_depth_scaling_sweep/run.py
-  - ordinary residual vs mHC residual across 4/8/12 layers.
-
-Goal:
-- Turn architecture ideas into repeatable runs.
-- Save logs and JSON summaries.
-- Avoid mixing experiment-specific code into jax_training/train.py.
 
 
 
@@ -664,10 +656,49 @@ Profiling lessons:
   - CSA block-start masking was faster-looking but causally wrong.
   - block-end masking required safe softmax for early tokens.
 
-Kernel lessons so far:
-- Custom kernels should be justified by measured bottlenecks.
-- Current first likely kernel candidate is Kimi parallel chunkwise, not because
-  it is interesting, but because profiling shows it is the major bottleneck.
-- CSA/HCA do not yet demand kernels at these sizes; they should first be scaled
-  and profiled further.
 
+
+IMportant commands of repo: 
+JAX experiments:  
+ - python -m experiment.deepseek_mla_latent_sweep.run --runs small medium large mha
+ - python -m experiment.kimi_deltanet_memory_sweep.run --mode pilot
+ - python -m experiment.kimi_deltanet_memory_sweep.run --mode full --runs all 
+ - python -m experiment.deepseek_sparse_topk_sweep.run --mode pilot
+ - python -m experiment.deepseek_sparse_topk_sweep.run --mode full --runs topk4 topk8 topk16 topk32
+ - python -m experiment.csa_hca_compression_sweep.run --mode pilot
+ - python -m experiment.csa_hca_compression_sweep.run --mode full
+ - python -m experiment.mhc_depth_scaling_sweep.run --mode pilot
+ - python -m experiment.mhc_depth_scaling_sweep.run --mode full
+
+Jax profiling:  
+ - python -m profiling.jax_profile --model all --preset small 
+ - python -m profiling.jax_profile --model sparse --preset small --trace --trace-mode train --iters 3 
+ - opening tensorboard: tensorboard --logdir "$(pwd)/profiling/traces" --host 0.0.0.0 --port 6006 --load_fast=false  
+
+
+Triton kernels:  
+ - python -m kernels.flash_attention 
+ - python -m kernels.kimi_triangular_solve 
+ - python -m kernels.mhc_route 
+ - python -m kernels.mhc_merge 
+ - python -m kernels.mhc_combined 
+ - python -m kernels.deepseek_moe_combine 
+
+Jax implementation:  
+ - python -m model.mhlatent_attention
+ - python -m model.kimi_deltanet 
+ - python -m model.deepseek_sparseatt 
+ - python -m model.deepseek_sparseatt 
+ - python -m model.deepseek_csa 
+ - python -m model.deepseek_mhc 
+
+
+Pytorch training:  
+ - python -m model.training
+
+Pytorch experiments:  
+ - python -m experiment.gqa_experiment
+ - python -m experiment.ffn_experiment
+ - python -m experiment.optimizer_experiment
+ - python -m experiment.sliding_window_experiment
+ - python -m experiment.scaling_laws

@@ -1,13 +1,13 @@
-Frontier Training Lab Technical Report
-Date: 2026-06-02
+# Frontier Training Lab Technical Report
 
 
-Idea: 
-this repo contain not just educational implementation alones but it has advanced architectures, kernels and training runs with experiements.  Majority of things ran in Nvidia geforce rtx 2050 and some experiments ran on Nvidia 4090. 
+
+## Idea
+
+This repo contain not just educational implementation alones but it has advanced architectures, kernels and training runs with experiements.  Majority of things ran in Nvidia geforce rtx 2050 and some experiments ran on Nvidia 4090. 
  
 
-Essence
-=====
+## Essence
 
 This report summarizes the work completed so far in the repository, from the
 first Triton FlashAttention implementation through the JAX reference
@@ -23,13 +23,11 @@ and others kernels are deepseek_moe.
 
 
 
-Implementations + training runs.
-==========================
+## Implementations + training runs.
 
 The repo now contains several JAX architecture references:
 
-1.1 MHLA / MLA Attention + DeepSeekMoE
---------------------------------------
+### 1.1 MHLA / MLA Attention + DeepSeekMoE
 
 File:
 - model/mhlatent_attention.py
@@ -57,8 +55,7 @@ Important correctness result:
   smoke test.
 
 
-1.2 Kimi DeltaNet
------------------
+### 1.2 Kimi DeltaNet
 
 File:
 - model/kimi_deltanet.py
@@ -88,8 +85,7 @@ Profiling result:
   medium preset causes severe XLA compile pressure.
 
 
-1.3 DeepSeek Sparse Attention
------------------------------
+### 1.3 DeepSeek Sparse Attention
 
 File:
 - model/deepseek_sparseatt.py
@@ -123,8 +119,7 @@ Current limitation:
   scoring.
 
 
-1.4 DeepSeek CSA / HCA / Hybrid Attention
------------------------------------------
+### 1.4 DeepSeek CSA / HCA / Hybrid Attention
 
 File:
 - model/deepseek_csa.py
@@ -157,8 +152,7 @@ Profiling result:
 - CSA+HCA is roughly additive and slower than either alone.
 
 
-1.5 mHC Residual Highway
-------------------------
+### 1.5 mHC Residual Highway
 
 File:
 - model/deepseek_mhc.py
@@ -190,8 +184,7 @@ Profiling result:
   deeper before stacking many blocks.
 
 
-JAX Training Infrastructure
-==============================
+## JAX Training Infrastructure
 
 Folder:
 - jax_training/
@@ -220,8 +213,7 @@ Purpose:
 
 
 
-Experiments.  
-===========================
+## Experiments.  
   
 This repo have two tpyes of experiments one is standard pytorch and second one is jax advanced architectures.  
 
@@ -258,8 +250,7 @@ pytorch experiments runners:
 
 
 
-Profiling Infrastructure
-===========================
+## Profiling Infrastructure
 
 Files:
 - profiling/__init__.py
@@ -297,8 +288,7 @@ Correct JAX profiling rules used:
 - block_until_ready is used so async GPU execution does not corrupt timing.
 
 
-Profiling Results: Small Preset
-==================================
+## Profiling Results: Small Preset
 
 Small preset:
 - B = 1
@@ -308,6 +298,7 @@ Small preset:
 
 Results:
 
+```text
 model             fwd_ms    train_ms   tok/s train   params
 ------------------------------------------------------------
 mhla              2.05      4.62       27,702        155,648
@@ -319,6 +310,7 @@ kimi_stepwise     22.85     124.15     1,031         393,216
 kimi_chunkwise    23.36     112.81     1,135         393,216
 kimi_parallel     6.87      17.59      7,277         393,216
 mhc               3.81      11.25      11,374        484,632
+```
 
 Small-preset interpretation:
 - MHLA, sparse, CSA, and HCA are all in a similar runtime band.
@@ -329,8 +321,7 @@ Small-preset interpretation:
   than attention references and has very high compile cost.
 
 
-8. Profiling Results: Medium Preset
-===================================
+## 8. Profiling Results: Medium Preset
 
 Medium preset:
 - B = 1
@@ -350,6 +341,7 @@ Medium preset:
 
 Results before termination:
 
+```text
 model             fwd_ms    train_ms   tok/s train   params
 ------------------------------------------------------------
 mhla              7.06      15.64      16,368        622,592
@@ -359,6 +351,7 @@ hca               5.72      14.99      17,079        475,648
 csa_hca           9.68      27.87      9,185         1,215,488
 kimi_stepwise     83.56     246.52     1,038         1,572,864
 kimi_chunkwise    96.25     379.80     674           1,572,864
+```
 
 The run terminated while compiling/running Kimi parallel. XLA reported a slow
 compile:
@@ -377,8 +370,7 @@ Medium-preset interpretation:
 
 
 
-Current Bottleneck Ranking from profiling. 
-=============================
+## Current Bottleneck Ranking from profiling. 
 
 Highest-priority bottleneck:
 1. Kimi DeltaNet
@@ -396,11 +388,10 @@ Second-priority bottleneck:
 
 
 
-kernels.  
-========
+## kernels.  
 
 
-====>  Kimi triangular solve Triton:
+### Kimi triangular solve Triton
 - Implemented a standalone PyTorch/Triton triangular solve kernel for the Kimi
   vector-gated correction solve.
 - Mathematical target:
@@ -454,7 +445,7 @@ kernels.
     - A.grad error around 1.4e-6.
     - U.grad error around 7.2e-7.
 
-====> mHC route/merge Triton:
+### mHC route/merge Triton
 - Split mHC around the natural framework boundary:
   - PyTorch/framework keeps GEMM-heavy routing projections and Layer_F.
   - Triton route/read kernel handles sigmoid, Sinkhorn-Knopp, and weighted
@@ -546,7 +537,7 @@ kernels.
     - Best small/mid case: 5.87x.
     - Larger cases stayed positive, about 1.88x to 3.56x.
 
-====> DeepSeekMoE combine Triton:
+### DeepSeekMoE combine Triton
 
 - Added a non-GEMM MoE combine kernel in kernels/deepseek_moe_combine.py.
 - Scope:
@@ -592,8 +583,7 @@ kernels.
 
 
 
-1. Baseline Context
-===================
+## 1. Baseline Context
 
 The original PyTorch baseline training setup is in model/training.py, with
 notes captured in baseline run.txt.
@@ -609,13 +599,14 @@ Baseline run notes:
 
 
 And then there is jax_training from which you can do training run with different architecture of jax.  
+```bash
 python -m jax_training.train --architecture csa_hca_moe
 python -m jax_training.train --architecture kimi_deltanet_moe
 python -m jax_training.train --architecture deepseek_sparse_moe
 python -m jax_training.train --architecture deepseek_mhla_moe  
+```
 
-2. Triton FlashAttention Work
-=============================
+## 2. Triton FlashAttention Work
 
 File:
 - kernels/flash_attention.py
@@ -634,8 +625,7 @@ Implemented:
 
 
 
-10. Lessons Learned
-===================
+## 10. Lessons Learned
 
 JAX reference implementation lessons:
 - JAX forces explicit math:
@@ -658,47 +648,58 @@ Profiling lessons:
 
 
 
-IMportant commands of repo: 
-JAX experiments:  
- - python -m experiment.deepseek_mla_latent_sweep.run --runs small medium large mha
- - python -m experiment.kimi_deltanet_memory_sweep.run --mode pilot
- - python -m experiment.kimi_deltanet_memory_sweep.run --mode full --runs all 
- - python -m experiment.deepseek_sparse_topk_sweep.run --mode pilot
- - python -m experiment.deepseek_sparse_topk_sweep.run --mode full --runs topk4 topk8 topk16 topk32
- - python -m experiment.csa_hca_compression_sweep.run --mode pilot
- - python -m experiment.csa_hca_compression_sweep.run --mode full
- - python -m experiment.mhc_depth_scaling_sweep.run --mode pilot
- - python -m experiment.mhc_depth_scaling_sweep.run --mode full
+## IMportant commands of repo
 
-Jax profiling:  
- - python -m profiling.jax_profile --model all --preset small 
- - python -m profiling.jax_profile --model sparse --preset small --trace --trace-mode train --iters 3 
- - opening tensorboard: tensorboard --logdir "$(pwd)/profiling/traces" --host 0.0.0.0 --port 6006 --load_fast=false  
+### JAX experiments
+```bash
+python -m experiment.deepseek_mla_latent_sweep.run --runs small medium large mha
+python -m experiment.kimi_deltanet_memory_sweep.run --mode pilot
+python -m experiment.kimi_deltanet_memory_sweep.run --mode full --runs all 
+python -m experiment.deepseek_sparse_topk_sweep.run --mode pilot
+python -m experiment.deepseek_sparse_topk_sweep.run --mode full --runs topk4 topk8 topk16 topk32
+python -m experiment.csa_hca_compression_sweep.run --mode pilot
+python -m experiment.csa_hca_compression_sweep.run --mode full
+python -m experiment.mhc_depth_scaling_sweep.run --mode pilot
+python -m experiment.mhc_depth_scaling_sweep.run --mode full
+```
 
+### Jax profiling
+```bash
+python -m profiling.jax_profile --model all --preset small 
+python -m profiling.jax_profile --model sparse --preset small --trace --trace-mode train --iters 3 
+tensorboard --logdir "$(pwd)/profiling/traces" --host 0.0.0.0 --port 6006 --load_fast=false  
+```
 
-Triton kernels:  
- - python -m kernels.flash_attention 
- - python -m kernels.kimi_triangular_solve 
- - python -m kernels.mhc_route 
- - python -m kernels.mhc_merge 
- - python -m kernels.mhc_combined 
- - python -m kernels.deepseek_moe_combine 
+### Triton kernels
+```bash
+python -m kernels.flash_attention 
+python -m kernels.kimi_triangular_solve 
+python -m kernels.mhc_route 
+python -m kernels.mhc_merge 
+python -m kernels.mhc_combined 
+python -m kernels.deepseek_moe_combine 
+```
 
-Jax implementation:  
- - python -m model.mhlatent_attention
- - python -m model.kimi_deltanet 
- - python -m model.deepseek_sparseatt 
- - python -m model.deepseek_sparseatt 
- - python -m model.deepseek_csa 
- - python -m model.deepseek_mhc 
+### Jax implementation
+```bash
+python -m model.mhlatent_attention
+python -m model.kimi_deltanet 
+python -m model.deepseek_sparseatt 
+python -m model.deepseek_sparseatt 
+python -m model.deepseek_csa 
+python -m model.deepseek_mhc 
+```
 
+### Pytorch training
+```bash
+python -m model.training
+```
 
-Pytorch training:  
- - python -m model.training
-
-Pytorch experiments:  
- - python -m experiment.gqa_experiment
- - python -m experiment.ffn_experiment
- - python -m experiment.optimizer_experiment
- - python -m experiment.sliding_window_experiment
- - python -m experiment.scaling_laws
+### Pytorch experiments
+```bash
+python -m experiment.gqa_experiment
+python -m experiment.ffn_experiment
+python -m experiment.optimizer_experiment
+python -m experiment.sliding_window_experiment
+python -m experiment.scaling_laws
+```

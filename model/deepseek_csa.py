@@ -286,7 +286,7 @@ def init_deepseek_hybrid_params(key, config):
 PHASE 1: PER-TOKEN PREPARATION (The Current Word)
 =====================================================================
 h_t -> compress -> c_t^Q, c_t^KV  
-(Notice: Memory position and index keys are NOT generated here anymore)
+
 
 query side:
     c_t^Q -> W_Q_A (absorbed W_K) -> q_t^A   [num_heads, latent_dim]

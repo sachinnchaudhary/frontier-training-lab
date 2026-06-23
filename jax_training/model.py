@@ -29,6 +29,11 @@ from model.deepseek_csa import (
     init_deepseek_csa_params,
     init_deepseek_hca_params,
 )
+from model.multi_lightening_index import (
+    LightningSparseConfig,
+    init_lightning_sparse_params,
+    lightning_sparse_attention,
+)
 from model.deepseek_mhc import (
     MHCConfig,
     init_mhc_params,
@@ -64,8 +69,11 @@ class JaxLMConfig:
     num_routed_experts: int = 4
     num_shared_experts: int = 1
     top_k: int = 2
+    lightning_lse_alpha: float = 4.0
+    use_moe: bool = True
     moe_top_k: int = 2
     expert_hidden_dim: int = 2048
+    moe_aux_loss_weight: float = 0.0
     eps: float = 1e-6
 
 
@@ -215,6 +223,23 @@ def _csa_config(config: JaxLMConfig) -> DeepSeekCSAConfig:
     )
 
 
+def _lightning_config(config: JaxLMConfig) -> LightningSparseConfig:
+    return LightningSparseConfig(
+        model_dim=config.model_dim,
+        num_heads=config.num_heads,
+        latent_dim=config.latent_dim,
+        rope_dim=config.rope_dim,
+        index_dim=config.index_dim,
+        index_heads=config.index_heads,
+        top_k=config.top_k,
+        lse_alpha=config.lightning_lse_alpha,
+        num_routed_experts=config.num_routed_experts,
+        num_shared_experts=config.num_shared_experts,
+        expert_hidden_dim=config.expert_hidden_dim,
+        eps=config.eps,
+    )
+
+
 def _mhc_config(config: JaxLMConfig) -> MHCConfig:
     return MHCConfig(
         model_dim=config.model_dim,
@@ -236,6 +261,7 @@ def init_lm_params(key, config: JaxLMConfig):
     kimi_config = _kimi_config(config)
     sparse_config = _sparse_config(config)
     csa_config = _csa_config(config)
+    lightning_config = _lightning_config(config)
     mhc_config = _mhc_config(config)
 
     blocks = []
@@ -255,6 +281,8 @@ def init_lm_params(key, config: JaxLMConfig):
             attn_params = init_kimi_deltanet_params(keys[offset], kimi_config)
         elif config.attention_type == "deepseek_sparse":
             attn_params = init_deepseek_sparse_params(keys[offset], sparse_config)
+        elif config.attention_type == "lightning_sparse":
+            attn_params = init_lightning_sparse_params(keys[offset], lightning_config)
         elif config.attention_type == "deepseek_csa_hca":
             csa_key, hca_key = jax.random.split(keys[offset])
             attn_params = {
@@ -271,12 +299,16 @@ def init_lm_params(key, config: JaxLMConfig):
         else:
             raise ValueError(f"unknown attention_type: {config.attention_type}")
 
-        blocks.append({
+        block = {
             "attn_norm": jnp.ones((config.model_dim,), dtype=jnp.float32),
             "attn": attn_params,
-            "moe_norm": jnp.ones((config.model_dim,), dtype=jnp.float32),
-            "moe": init_deepseek_moe_params(keys[offset + 1], attn_config),
-        })
+        }
+        if config.use_moe:
+            block.update({
+                "moe_norm": jnp.ones((config.model_dim,), dtype=jnp.float32),
+                "moe": init_deepseek_moe_params(keys[offset + 1], attn_config),
+            })
+        blocks.append(block)
         offset += 2
 
     return {
@@ -292,6 +324,7 @@ def transformer_block(x, block_params, config: JaxLMConfig):
     kimi_config = _kimi_config(config)
     sparse_config = _sparse_config(config)
     csa_config = _csa_config(config)
+    lightning_config = _lightning_config(config)
     mhc_config = _mhc_config(config)
 
     h = rms_norm(x, block_params["attn_norm"], eps=config.eps)
@@ -314,6 +347,8 @@ def transformer_block(x, block_params, config: JaxLMConfig):
         )
         x = mhc_readout(h_streams, block_params["attn"]["mhc"])
 
+        if not config.use_moe:
+            return x
         h = rms_norm(x, block_params["moe_norm"], eps=config.eps)
         x = x + deepseek_moe(h, block_params["moe"], attn_config)
         return x
@@ -323,6 +358,8 @@ def transformer_block(x, block_params, config: JaxLMConfig):
         h = kimi_deltanet_parallel_chunkwise(h, block_params["attn"], kimi_config)
     elif config.attention_type == "deepseek_sparse":
         h = deepseek_sparse_attention(h, block_params["attn"], sparse_config)
+    elif config.attention_type == "lightning_sparse":
+        h = lightning_sparse_attention(h, block_params["attn"], lightning_config)
     elif config.attention_type == "deepseek_csa_hca":
         h = deepseek_hybrid_attention(h, block_params["attn"], csa_config)
     elif config.attention_type == "deepseek_csa_hca_mhc":
@@ -346,6 +383,8 @@ def transformer_block(x, block_params, config: JaxLMConfig):
         )
         x = mhc_readout(h_streams, block_params["attn"]["mhc"])
 
+        if not config.use_moe:
+            return x
         h = rms_norm(x, block_params["moe_norm"], eps=config.eps)
         x = x + deepseek_moe(h, block_params["moe"], attn_config)
         return x
@@ -353,10 +392,113 @@ def transformer_block(x, block_params, config: JaxLMConfig):
         raise ValueError(f"unknown attention_type: {config.attention_type}")
     x = x + h
 
+    if not config.use_moe:
+        return x
     h = rms_norm(x, block_params["moe_norm"], eps=config.eps)
     x = x + deepseek_moe(h, block_params["moe"], attn_config)
 
     return x
+
+
+def moe_router_aux_stats(x, moe_params, config: JaxLMConfig):
+    attn_config = _attention_config(config)
+    router_logits = jnp.matmul(x, moe_params["router"])
+    router_probs = jax.nn.softmax(router_logits, axis=-1)
+    _, top_indices = jax.lax.top_k(router_logits, k=attn_config.top_k)
+
+    E = attn_config.num_routed_experts
+    K = attn_config.top_k
+    one_hot = jax.nn.one_hot(top_indices, E, dtype=x.dtype)
+    selected = jnp.sum(one_hot, axis=-2)
+    token_fraction = jnp.mean(selected, axis=(0, 1)) / K
+    prob_fraction = jnp.mean(router_probs, axis=(0, 1))
+    aux_loss = E * jnp.sum(token_fraction * prob_fraction)
+
+    entropy = -jnp.sum(router_probs * jnp.log(router_probs + config.eps), axis=-1)
+    dead_experts = jnp.sum(token_fraction <= 0.0)
+    return {
+        "moe_aux_loss": aux_loss,
+        "moe_router_entropy": jnp.mean(entropy),
+        "moe_router_logit_std": jnp.std(router_logits),
+        "moe_expert_frac": token_fraction,
+        "moe_router_prob_frac": prob_fraction,
+        "moe_expert_frac_max": jnp.max(token_fraction),
+        "moe_expert_frac_min": jnp.min(token_fraction),
+        "moe_expert_frac_std": jnp.std(token_fraction),
+        "moe_dead_experts": dead_experts,
+    }
+
+
+def transformer_block_with_moe_stats(x, block_params, config: JaxLMConfig):
+    attn_config = _attention_config(config)
+    kimi_config = _kimi_config(config)
+    sparse_config = _sparse_config(config)
+    csa_config = _csa_config(config)
+    lightning_config = _lightning_config(config)
+    mhc_config = _mhc_config(config)
+
+    h = rms_norm(x, block_params["attn_norm"], eps=config.eps)
+    if config.attention_type == "mha":
+        h = mha_attention(h, block_params["attn"], config)
+        x = x + h
+    elif config.attention_type == "mha_mhc":
+        h_streams = jnp.broadcast_to(
+            h[:, :, None, :],
+            (h.shape[0], h.shape[1], config.num_mhc_streams, config.model_dim),
+        )
+
+        def layer_fn(h_in):
+            return mha_attention(h_in, block_params["attn"]["mha"], config)
+
+        h_streams = mhc_block(
+            h_streams,
+            block_params["attn"]["mhc"],
+            mhc_config,
+            layer_fn,
+        )
+        x = mhc_readout(h_streams, block_params["attn"]["mhc"])
+    elif config.attention_type == "mhla":
+        h = mhlatent_attention(h, block_params["attn"], attn_config)
+        x = x + h
+    elif config.attention_type == "kimi_deltanet":
+        h = kimi_deltanet_parallel_chunkwise(h, block_params["attn"], kimi_config)
+        x = x + h
+    elif config.attention_type == "deepseek_sparse":
+        h = deepseek_sparse_attention(h, block_params["attn"], sparse_config)
+        x = x + h
+    elif config.attention_type == "lightning_sparse":
+        h = lightning_sparse_attention(h, block_params["attn"], lightning_config)
+        x = x + h
+    elif config.attention_type == "deepseek_csa_hca":
+        h = deepseek_hybrid_attention(h, block_params["attn"], csa_config)
+        x = x + h
+    elif config.attention_type == "deepseek_csa_hca_mhc":
+        h_streams = jnp.broadcast_to(
+            h[:, :, None, :],
+            (h.shape[0], h.shape[1], config.num_mhc_streams, config.model_dim),
+        )
+
+        def layer_fn(h_in):
+            hybrid_params = {
+                "csa": block_params["attn"]["csa"],
+                "hca": block_params["attn"]["hca"],
+            }
+            return deepseek_hybrid_attention(h_in, hybrid_params, csa_config)
+
+        h_streams = mhc_block(
+            h_streams,
+            block_params["attn"]["mhc"],
+            mhc_config,
+            layer_fn,
+        )
+        x = mhc_readout(h_streams, block_params["attn"]["mhc"])
+    else:
+        raise ValueError(f"unknown attention_type: {config.attention_type}")
+
+    h = rms_norm(x, block_params["moe_norm"], eps=config.eps)
+    moe_stats = moe_router_aux_stats(h, block_params["moe"], config)
+    x = x + deepseek_moe(h, block_params["moe"], attn_config)
+    return x, moe_stats
 
 
 def lm_forward(params, token_ids, config: JaxLMConfig):
@@ -367,6 +509,29 @@ def lm_forward(params, token_ids, config: JaxLMConfig):
 
     x = rms_norm(x, params["final_norm"], eps=config.eps)
     return jnp.matmul(x, params["lm_head"])
+
+
+def lm_forward_with_moe_stats(params, token_ids, config: JaxLMConfig):
+    x = params["token_embedding"][token_ids]
+    stats_accum = None
+
+    for block_params in params["blocks"]:
+        x, block_stats = transformer_block_with_moe_stats(x, block_params, config)
+        if stats_accum is None:
+            stats_accum = block_stats
+        else:
+            stats_accum = {
+                name: stats_accum[name] + block_stats[name]
+                for name in stats_accum
+            }
+
+    x = rms_norm(x, params["final_norm"], eps=config.eps)
+    logits = jnp.matmul(x, params["lm_head"])
+    stats = {
+        name: value / config.num_layers
+        for name, value in stats_accum.items()
+    }
+    return logits, stats
 
 
 def cross_entropy_loss(logits, targets):
@@ -382,3 +547,17 @@ def cross_entropy_loss(logits, targets):
 def loss_fn(params, token_ids, targets, config: JaxLMConfig):
     logits = lm_forward(params, token_ids, config)
     return cross_entropy_loss(logits, targets)
+
+
+def loss_with_moe_aux(params, token_ids, targets, config: JaxLMConfig):
+    logits, stats = lm_forward_with_moe_stats(params, token_ids, config)
+    ce_loss = cross_entropy_loss(logits, targets)
+    aux_loss = stats["moe_aux_loss"]
+    total_loss = ce_loss + config.moe_aux_loss_weight * aux_loss
+    metrics = {
+        "ce_loss": ce_loss,
+        "moe_aux_loss": aux_loss,
+        "loss_total": total_loss,
+        **stats,
+    }
+    return total_loss, metrics

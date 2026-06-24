@@ -69,7 +69,16 @@ class JaxLMConfig:
     num_routed_experts: int = 4
     num_shared_experts: int = 1
     top_k: int = 2
+    deepseek_shared_index_key: bool = True
+    deepseek_index_aux_weight: float = 0.02
+    deepseek_teacher_temp: float = 1.0
+    deepseek_student_temp: float = 1.0
+    deepseek_index_score_bias_beta: float = 0.0
     lightning_lse_alpha: float = 4.0
+    lightning_index_aux_weight: float = 0.02
+    lightning_teacher_temp: float = 1.0
+    lightning_student_temp: float = 1.0
+    lightning_index_score_bias_beta: float = 0.0
     use_moe: bool = True
     moe_top_k: int = 2
     expert_hidden_dim: int = 2048
@@ -197,8 +206,11 @@ def _sparse_config(config: JaxLMConfig) -> DeepSeekSparseConfig:
         index_dim=config.index_dim,
         index_heads=config.index_heads,
         top_k=config.top_k,
-        num_routed_experts=config.num_routed_experts,
-        num_shared_experts=config.num_shared_experts,
+        shared_index_key=config.deepseek_shared_index_key,
+        index_aux_weight=config.deepseek_index_aux_weight,
+        teacher_temp=config.deepseek_teacher_temp,
+        student_temp=config.deepseek_student_temp,
+        index_score_bias_beta=config.deepseek_index_score_bias_beta,
         expert_hidden_dim=config.expert_hidden_dim,
         eps=config.eps,
     )
@@ -233,8 +245,10 @@ def _lightning_config(config: JaxLMConfig) -> LightningSparseConfig:
         index_heads=config.index_heads,
         top_k=config.top_k,
         lse_alpha=config.lightning_lse_alpha,
-        num_routed_experts=config.num_routed_experts,
-        num_shared_experts=config.num_shared_experts,
+        index_aux_weight=config.lightning_index_aux_weight,
+        teacher_temp=config.lightning_teacher_temp,
+        student_temp=config.lightning_student_temp,
+        index_score_bias_beta=config.lightning_index_score_bias_beta,
         expert_hidden_dim=config.expert_hidden_dim,
         eps=config.eps,
     )
@@ -511,6 +525,82 @@ def lm_forward(params, token_ids, config: JaxLMConfig):
     return jnp.matmul(x, params["lm_head"])
 
 
+def transformer_block_with_deepseek_sparse_aux(x, block_params, config: JaxLMConfig):
+    attn_config = _attention_config(config)
+    sparse_config = _sparse_config(config)
+
+    h = rms_norm(x, block_params["attn_norm"], eps=config.eps)
+    h, index_aux = deepseek_sparse_attention(
+        h,
+        block_params["attn"],
+        sparse_config,
+        return_aux=True,
+    )
+    x = x + h
+
+    if config.use_moe:
+        h = rms_norm(x, block_params["moe_norm"], eps=config.eps)
+        x = x + deepseek_moe(h, block_params["moe"], attn_config)
+
+    return x, index_aux
+
+
+def transformer_block_with_lightning_aux(x, block_params, config: JaxLMConfig):
+    attn_config = _attention_config(config)
+    lightning_config = _lightning_config(config)
+
+    h = rms_norm(x, block_params["attn_norm"], eps=config.eps)
+    h, index_aux = lightning_sparse_attention(
+        h,
+        block_params["attn"],
+        lightning_config,
+        return_aux=True,
+    )
+    x = x + h
+
+    if config.use_moe:
+        h = rms_norm(x, block_params["moe_norm"], eps=config.eps)
+        x = x + deepseek_moe(h, block_params["moe"], attn_config)
+
+    return x, index_aux
+
+
+def lm_forward_with_deepseek_sparse_aux(params, token_ids, config: JaxLMConfig):
+    if config.attention_type != "deepseek_sparse":
+        raise ValueError("sparse auxiliary loss is only valid for deepseek_sparse")
+
+    x = params["token_embedding"][token_ids]
+    index_aux_total = jnp.asarray(0.0, dtype=x.dtype)
+
+    for block_params in params["blocks"]:
+        x, index_aux = transformer_block_with_deepseek_sparse_aux(
+            x,
+            block_params,
+            config,
+        )
+        index_aux_total = index_aux_total + index_aux
+
+    x = rms_norm(x, params["final_norm"], eps=config.eps)
+    logits = jnp.matmul(x, params["lm_head"])
+    return logits, index_aux_total / config.num_layers
+
+
+def lm_forward_with_lightning_aux(params, token_ids, config: JaxLMConfig):
+    if config.attention_type != "lightning_sparse":
+        raise ValueError("lightning auxiliary loss is only valid for lightning_sparse")
+
+    x = params["token_embedding"][token_ids]
+    index_aux_total = jnp.asarray(0.0, dtype=x.dtype)
+
+    for block_params in params["blocks"]:
+        x, index_aux = transformer_block_with_lightning_aux(x, block_params, config)
+        index_aux_total = index_aux_total + index_aux
+
+    x = rms_norm(x, params["final_norm"], eps=config.eps)
+    logits = jnp.matmul(x, params["lm_head"])
+    return logits, index_aux_total / config.num_layers
+
+
 def lm_forward_with_moe_stats(params, token_ids, config: JaxLMConfig):
     x = params["token_embedding"][token_ids]
     stats_accum = None
@@ -547,6 +637,40 @@ def cross_entropy_loss(logits, targets):
 def loss_fn(params, token_ids, targets, config: JaxLMConfig):
     logits = lm_forward(params, token_ids, config)
     return cross_entropy_loss(logits, targets)
+
+
+def loss_with_deepseek_sparse_index_aux(params, token_ids, targets, config: JaxLMConfig):
+    logits, index_aux_loss = lm_forward_with_deepseek_sparse_aux(
+        params,
+        token_ids,
+        config,
+    )
+    ce_loss = cross_entropy_loss(logits, targets)
+    total_loss = ce_loss + config.deepseek_index_aux_weight * index_aux_loss
+    return total_loss, {
+        "ce_loss": ce_loss,
+        "index_aux_loss": index_aux_loss,
+        "index_aux_weight": jnp.asarray(
+            config.deepseek_index_aux_weight,
+            dtype=ce_loss.dtype,
+        ),
+        "loss_total": total_loss,
+    }
+
+
+def loss_with_lightning_index_aux(params, token_ids, targets, config: JaxLMConfig):
+    logits, index_aux_loss = lm_forward_with_lightning_aux(params, token_ids, config)
+    ce_loss = cross_entropy_loss(logits, targets)
+    total_loss = ce_loss + config.lightning_index_aux_weight * index_aux_loss
+    return total_loss, {
+        "ce_loss": ce_loss,
+        "index_aux_loss": index_aux_loss,
+        "index_aux_weight": jnp.asarray(
+            config.lightning_index_aux_weight,
+            dtype=ce_loss.dtype,
+        ),
+        "loss_total": total_loss,
+    }
 
 
 def loss_with_moe_aux(params, token_ids, targets, config: JaxLMConfig):

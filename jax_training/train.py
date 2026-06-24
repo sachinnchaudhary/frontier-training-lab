@@ -14,7 +14,14 @@ import jax.numpy as jnp
 import numpy as np
 
 from jax_training.data import get_batch, load_cached_lm_dataset
-from jax_training.model import JaxLMConfig, init_lm_params, loss_fn, loss_with_moe_aux
+from jax_training.model import (
+    JaxLMConfig,
+    init_lm_params,
+    loss_fn,
+    loss_with_deepseek_sparse_index_aux,
+    loss_with_lightning_index_aux,
+    loss_with_moe_aux,
+)
 
 
 LATENT_SWEEP_DIMS = {
@@ -280,6 +287,8 @@ def make_train_step(model_config: JaxLMConfig, train_config: TrainConfig, mask):
         expert_count = model_config.num_routed_experts
         return {
             "ce_loss": loss,
+            "index_aux_loss": jnp.asarray(0.0, dtype=loss.dtype),
+            "index_aux_weight": jnp.asarray(0.0, dtype=loss.dtype),
             "moe_aux_loss": jnp.asarray(0.0, dtype=loss.dtype),
             "loss_total": loss,
             "moe_router_entropy": jnp.asarray(0.0, dtype=loss.dtype),
@@ -293,6 +302,22 @@ def make_train_step(model_config: JaxLMConfig, train_config: TrainConfig, mask):
         }
 
     def loss_and_metrics(params, xb, yb):
+        if model_config.attention_type == "deepseek_sparse":
+            loss, metrics = loss_with_deepseek_sparse_index_aux(
+                params,
+                xb,
+                yb,
+                model_config,
+            )
+            return loss, {**make_metrics(metrics["ce_loss"]), **metrics}
+        if model_config.attention_type == "lightning_sparse":
+            loss, metrics = loss_with_lightning_index_aux(
+                params,
+                xb,
+                yb,
+                model_config,
+            )
+            return loss, {**make_metrics(metrics["ce_loss"]), **metrics}
         if model_config.use_moe:
             return loss_with_moe_aux(params, xb, yb, model_config)
         loss = loss_fn(params, xb, yb, model_config)
@@ -372,6 +397,17 @@ def write_json(path, payload):
         f.write("\n")
 
 
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    lowered = value.lower()
+    if lowered in ("1", "true", "yes", "y", "on"):
+        return True
+    if lowered in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected boolean value, got {value!r}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run standard JAX LM training.")
     parser.add_argument(
@@ -424,7 +460,53 @@ def parse_args():
     parser.add_argument("--index-dim", type=int, default=64)
     parser.add_argument("--index-heads", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument(
+        "--shared-index-key",
+        type=parse_bool,
+        default=None,
+        help=(
+            "Generic sparse-indexer alias. Applies to DeepSeek Sparse; "
+            "Lightning Sparse always uses the shared-key form."
+        ),
+    )
+    parser.add_argument(
+        "--index-aux-weight",
+        type=float,
+        default=None,
+        help="Generic sparse-indexer auxiliary loss weight for both sparse variants.",
+    )
+    parser.add_argument(
+        "--teacher-temp",
+        type=float,
+        default=None,
+        help="Generic sparse-indexer teacher temperature for both sparse variants.",
+    )
+    parser.add_argument(
+        "--student-temp",
+        type=float,
+        default=None,
+        help="Generic sparse-indexer student temperature for both sparse variants.",
+    )
+    parser.add_argument(
+        "--index-score-bias-beta",
+        type=float,
+        default=None,
+        help="Generic selected-index-score attention bias scale for both sparse variants.",
+    )
+    parser.add_argument(
+        "--deepseek-shared-index-key",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--deepseek-index-aux-weight", type=float, default=0.02)
+    parser.add_argument("--deepseek-teacher-temp", type=float, default=1.0)
+    parser.add_argument("--deepseek-student-temp", type=float, default=1.0)
+    parser.add_argument("--deepseek-index-score-bias-beta", type=float, default=0.0)
     parser.add_argument("--lightning-lse-alpha", type=float, default=4.0)
+    parser.add_argument("--lightning-index-aux-weight", type=float, default=0.02)
+    parser.add_argument("--lightning-teacher-temp", type=float, default=1.0)
+    parser.add_argument("--lightning-student-temp", type=float, default=1.0)
+    parser.add_argument("--lightning-index-score-bias-beta", type=float, default=0.0)
     parser.add_argument("--moe-top-k", type=int, default=2)
     parser.add_argument("--csa-compress-rate", type=int, default=8)
     parser.add_argument("--hca-compress-rate", type=int, default=64)
@@ -556,6 +638,47 @@ def build_model_config(dataset, train_config: TrainConfig, args) -> JaxLMConfig:
     num_shared_experts = args.num_shared_experts
     expert_hidden_dim = args.expert_hidden_dim
     moe_top_k = args.moe_top_k
+    shared_index_key = (
+        args.shared_index_key
+        if args.shared_index_key is not None
+        else args.deepseek_shared_index_key
+    )
+    deepseek_index_aux_weight = (
+        args.index_aux_weight
+        if args.index_aux_weight is not None
+        else args.deepseek_index_aux_weight
+    )
+    lightning_index_aux_weight = (
+        args.index_aux_weight
+        if args.index_aux_weight is not None
+        else args.lightning_index_aux_weight
+    )
+    deepseek_teacher_temp = (
+        args.teacher_temp if args.teacher_temp is not None else args.deepseek_teacher_temp
+    )
+    lightning_teacher_temp = (
+        args.teacher_temp
+        if args.teacher_temp is not None
+        else args.lightning_teacher_temp
+    )
+    deepseek_student_temp = (
+        args.student_temp if args.student_temp is not None else args.deepseek_student_temp
+    )
+    lightning_student_temp = (
+        args.student_temp
+        if args.student_temp is not None
+        else args.lightning_student_temp
+    )
+    deepseek_index_score_bias_beta = (
+        args.index_score_bias_beta
+        if args.index_score_bias_beta is not None
+        else args.deepseek_index_score_bias_beta
+    )
+    lightning_index_score_bias_beta = (
+        args.index_score_bias_beta
+        if args.index_score_bias_beta is not None
+        else args.lightning_index_score_bias_beta
+    )
 
     if train_config.preflight:
         model_dim = cli_value(args, "--model-dim", 256)
@@ -608,7 +731,16 @@ def build_model_config(dataset, train_config: TrainConfig, args) -> JaxLMConfig:
         num_routed_experts=num_routed_experts,
         num_shared_experts=num_shared_experts,
         top_k=top_k,
+        deepseek_shared_index_key=shared_index_key,
+        deepseek_index_aux_weight=deepseek_index_aux_weight,
+        deepseek_teacher_temp=deepseek_teacher_temp,
+        deepseek_student_temp=deepseek_student_temp,
+        deepseek_index_score_bias_beta=deepseek_index_score_bias_beta,
         lightning_lse_alpha=args.lightning_lse_alpha,
+        lightning_index_aux_weight=lightning_index_aux_weight,
+        lightning_teacher_temp=lightning_teacher_temp,
+        lightning_student_temp=lightning_student_temp,
+        lightning_index_score_bias_beta=lightning_index_score_bias_beta,
         use_moe=bool(preset.get("use_moe", True)),
         moe_top_k=moe_top_k,
         expert_hidden_dim=expert_hidden_dim,
@@ -629,6 +761,16 @@ def build_deepseek_mla_model_config(dataset, train_config: TrainConfig) -> JaxLM
         index_dim = 64
         index_heads = 4
         top_k = 2
+        deepseek_shared_index_key = True
+        deepseek_index_aux_weight = 0.02
+        deepseek_teacher_temp = 1.0
+        deepseek_student_temp = 1.0
+        deepseek_index_score_bias_beta = 0.0
+        lightning_lse_alpha = 4.0
+        lightning_index_aux_weight = 0.02
+        lightning_teacher_temp = 1.0
+        lightning_student_temp = 1.0
+        lightning_index_score_bias_beta = 0.0
         moe_top_k = 3
         csa_compress_rate = 8
         hca_compress_rate = 64
@@ -737,6 +879,8 @@ def run_training(train_config: TrainConfig, model_config: JaxLMConfig, dataset=N
 
         train_loss_f = float(train_loss)
         ce_loss_f = float(train_metrics["ce_loss"])
+        index_aux_loss_f = float(train_metrics["index_aux_loss"])
+        index_aux_weight_f = float(train_metrics["index_aux_weight"])
         moe_aux_loss_f = float(train_metrics["moe_aux_loss"])
         moe_router_entropy_f = float(train_metrics["moe_router_entropy"])
         moe_router_logit_std_f = float(train_metrics["moe_router_logit_std"])
@@ -832,6 +976,8 @@ def run_training(train_config: TrainConfig, model_config: JaxLMConfig, dataset=N
                 "step": step,
                 "train_loss": train_loss_f,
                 "ce_loss": ce_loss_f,
+                "index_aux_loss": index_aux_loss_f,
+                "index_aux_weight": index_aux_weight_f,
                 "moe_aux_loss": moe_aux_loss_f,
                 "moe_router_entropy": moe_router_entropy_f,
                 "moe_router_logit_std": moe_router_logit_std_f,
@@ -896,7 +1042,20 @@ def run_training(train_config: TrainConfig, model_config: JaxLMConfig, dataset=N
                 "num_shared_experts": model_config.num_shared_experts,
                 "use_moe": model_config.use_moe,
                 "top_k": model_config.top_k,
+                "deepseek_shared_index_key": model_config.deepseek_shared_index_key,
+                "deepseek_index_aux_weight": model_config.deepseek_index_aux_weight,
+                "deepseek_teacher_temp": model_config.deepseek_teacher_temp,
+                "deepseek_student_temp": model_config.deepseek_student_temp,
+                "deepseek_index_score_bias_beta": (
+                    model_config.deepseek_index_score_bias_beta
+                ),
                 "lightning_lse_alpha": model_config.lightning_lse_alpha,
+                "lightning_index_aux_weight": model_config.lightning_index_aux_weight,
+                "lightning_teacher_temp": model_config.lightning_teacher_temp,
+                "lightning_student_temp": model_config.lightning_student_temp,
+                "lightning_index_score_bias_beta": (
+                    model_config.lightning_index_score_bias_beta
+                ),
                 "moe_top_k": model_config.moe_top_k,
                 "moe_aux_loss_weight": model_config.moe_aux_loss_weight,
                 "expert_hidden_dim": model_config.expert_hidden_dim,
@@ -908,6 +1067,7 @@ def run_training(train_config: TrainConfig, model_config: JaxLMConfig, dataset=N
                 f"step={step} "
                 f"train_loss={train_loss_f:.4f} "
                 f"ce_loss={ce_loss_f:.4f} "
+                f"index_aux={index_aux_loss_f:.4f} "
                 f"moe_aux={moe_aux_loss_f:.4f} "
                 f"moe_dead={moe_dead_experts_f:.0f} "
                 f"moe_frac_minmax=[{moe_expert_frac_min_f:.2f},{moe_expert_frac_max_f:.2f}] "

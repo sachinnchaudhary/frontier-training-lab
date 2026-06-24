@@ -51,6 +51,8 @@ def validate_lightning_sparse_config(config):
         raise ValueError("top_k must be >= 1")
     if config.lse_alpha <= 0:
         raise ValueError("lse_alpha must be > 0")
+    if config.expert_hidden_dim < 1:
+        raise ValueError("expert_hidden_dim must be >= 1")
 
 
 def validate_lightning_sparse_params(params, config):
@@ -60,6 +62,7 @@ def validate_lightning_sparse_params(params, config):
     R = config.rope_dim
     Ih = config.index_heads
     I = config.index_dim
+    F = config.expert_hidden_dim
 
     expected_shapes = {
         "q_down": (D, C),
@@ -72,6 +75,10 @@ def validate_lightning_sparse_params(params, config):
         "idx_router": (D, Ih),
         "idx_log_tau": (Ih,),
         "out_proj": (H * C, D),
+        "ffn_norm": (D,),
+        "ffn_gate": (D, F),
+        "ffn_up": (D, F),
+        "ffn_down": (F, D),
     }
 
     for name, expected_shape in expected_shapes.items():
@@ -100,13 +107,14 @@ def validate_lightning_sparse_inputs(x, params, config):
 
 def init_lightning_sparse_params(key, config):
     validate_lightning_sparse_config(config)
-    keys = jax.random.split(key, 9)
+    keys = jax.random.split(key, 12)
     D = config.model_dim
     H = config.num_heads
     C = config.latent_dim
     R = config.rope_dim
     Ih = config.index_heads
     I = config.index_dim
+    F = config.expert_hidden_dim
 
     return {
         "q_down": _xavier(keys[0], (D, C)),
@@ -119,6 +127,10 @@ def init_lightning_sparse_params(key, config):
         "idx_router": _xavier(keys[7], (D, Ih)),
         "idx_log_tau": jnp.zeros((Ih,), dtype=jnp.float32),
         "out_proj": _xavier(keys[8], (H * C, D)),
+        "ffn_norm": jnp.ones((D,), dtype=jnp.float32),
+        "ffn_gate": _xavier(keys[9], (D, F)),
+        "ffn_up": _xavier(keys[10], (D, F)),
+        "ffn_down": _xavier(keys[11], (F, D)),
     }
 
 
@@ -190,7 +202,20 @@ def lightning_sparse_attention(x, params, config):
 
     out = jnp.einsum("bqhk,bqkc->bqhc", probs, selected_vals)
     out = jnp.reshape(out, [B, T, H * C])
-    return jnp.matmul(out, params["out_proj"])
+    out = jnp.matmul(out, params["out_proj"])
+    return out + feedforward(rms_norm(out, params["ffn_norm"], config.eps), params)
+
+
+def rms_norm(x, weight, eps=1e-6):
+    rms = jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
+    return x * rms * weight
+
+
+def feedforward(x, params):
+    gate = jnp.matmul(x, params["ffn_gate"])
+    up = jnp.matmul(x, params["ffn_up"])
+    hidden = jax.nn.silu(gate) * up
+    return jnp.matmul(hidden, params["ffn_down"])
 
 
 def apply_rope(x):
@@ -268,6 +293,7 @@ if __name__ == "__main__":
         index_heads=3,
         top_k=2,
         lse_alpha=4.0,
+        expert_hidden_dim=64,
     )
 
     param_key, x_key = jax.random.split(key)

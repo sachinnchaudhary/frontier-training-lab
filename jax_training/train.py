@@ -450,6 +450,11 @@ def parse_args():
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=250)
     parser.add_argument("--eval-batches", type=int, default=20)
+    parser.add_argument("--muon-lr", type=float, default=None)
+    parser.add_argument("--adamw-lr", type=float, default=None)
+    parser.add_argument("--warmup-steps", type=int, default=None)
+    parser.add_argument("--min-lr-ratio", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument(
         "--moe-aux-loss-weight",
         type=float,
@@ -515,6 +520,17 @@ def build_train_config(args) -> TrainConfig:
         max_grad_norm=args.max_grad_norm,
         grad_clip_norm=args.grad_clip_norm,
         moe_aux_loss_weight=args.moe_aux_loss_weight,
+        muon_lr=args.muon_lr if args.muon_lr is not None else TrainConfig.muon_lr,
+        adamw_lr=args.adamw_lr if args.adamw_lr is not None else TrainConfig.adamw_lr,
+        warmup_steps=(
+            args.warmup_steps if args.warmup_steps is not None else TrainConfig.warmup_steps
+        ),
+        min_lr_ratio=(
+            args.min_lr_ratio if args.min_lr_ratio is not None else TrainConfig.min_lr_ratio
+        ),
+        weight_decay=(
+            args.weight_decay if args.weight_decay is not None else TrainConfig.weight_decay
+        ),
     )
 
 

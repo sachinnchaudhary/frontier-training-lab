@@ -79,6 +79,8 @@ def validate_deepseek_sparse_config(config):
         raise ValueError("num_routed_experts must be >= 1")
     if config.num_shared_experts < 1:
         raise ValueError("num_shared_experts must be >= 1")
+    if config.expert_hidden_dim < 1:
+        raise ValueError("expert_hidden_dim must be >= 1")
 
 
 def validate_deepseek_sparse_params(params, config):
@@ -88,6 +90,7 @@ def validate_deepseek_sparse_params(params, config):
     R = config.rope_dim
     I = config.index_dim
     Ih = config.index_heads
+    F = config.expert_hidden_dim
 
     expected_shapes = {
         "q_down": (D, C),
@@ -99,6 +102,10 @@ def validate_deepseek_sparse_params(params, config):
         "idx_k": (D, Ih * I),
         "idx_w": (D, Ih),
         "out_proj": (H * C, D),
+        "ffn_norm": (D,),
+        "ffn_gate": (D, F),
+        "ffn_up": (D, F),
+        "ffn_down": (F, D),
     }
 
     for name, expected_shape in expected_shapes.items():
@@ -127,13 +134,14 @@ def validate_deepseek_sparse_inputs(x, params, config):
 
 def init_deepseek_sparse_params(key, config):
     validate_deepseek_sparse_config(config)
-    keys = jax.random.split(key, 9)
+    keys = jax.random.split(key, 12)
     D = config.model_dim
     H = config.num_heads
     C = config.latent_dim
     R = config.rope_dim
     I = config.index_dim
     Ih = config.index_heads
+    F = config.expert_hidden_dim
 
     return {
         "q_down": _xavier(keys[0], (D, C)),
@@ -145,6 +153,10 @@ def init_deepseek_sparse_params(key, config):
         "idx_k": _xavier(keys[6], (D, Ih * I)),
         "idx_w": _xavier(keys[7], (D, Ih)),
         "out_proj": _xavier(keys[8], (H * C, D)),
+        "ffn_norm": jnp.ones((D,), dtype=jnp.float32),
+        "ffn_gate": _xavier(keys[9], (D, F)),
+        "ffn_up": _xavier(keys[10], (D, F)),
+        "ffn_down": _xavier(keys[11], (F, D)),
     }
 
 
@@ -231,8 +243,20 @@ def deepseek_sparse_attention(x, params, config):
 
     out = jnp.matmul(out, params["out_proj"]) 
 
-    return out 
+    return out + feedforward(rms_norm(out, params["ffn_norm"], config.eps), params)
  
+
+def rms_norm(x, weight, eps=1e-6):
+    rms = jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
+    return x * rms * weight
+
+
+def feedforward(x, params):
+    gate = jnp.matmul(x, params["ffn_gate"])
+    up = jnp.matmul(x, params["ffn_up"])
+    hidden = jax.nn.silu(gate) * up
+    return jnp.matmul(hidden, params["ffn_down"])
+
 
 
 def deepseek_moe(x, params, config):  
@@ -396,6 +420,7 @@ if __name__ == "__main__":
         index_dim=8,
         index_heads=2,
         top_k=4,
+        expert_hidden_dim=64,
     )
 
     param_key, x_key = jax.random.split(key)

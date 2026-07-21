@@ -1,0 +1,12 @@
+torch
+transformers
+datasets
+accelerate
+peft
+trl[vllm]
+math-verify
+pyyaml
+tensorboard 
+pytest  
+matplotlib
+numpy

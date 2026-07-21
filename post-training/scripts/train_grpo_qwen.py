@@ -316,7 +316,6 @@ def build_training_args(config: dict[str, Any]) -> GRPOConfig:
         "bf16": config["bf16"],
         "gradient_checkpointing":
             config["gradient_checkpointing"],
-        "use_cache": False,
 
         "use_vllm": config["use_vllm"],
         "vllm_mode": config["vllm_mode"],

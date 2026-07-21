@@ -120,12 +120,14 @@ def load_model_and_tokenizer(model_path: str):
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
         trust_remote_code=False,
+        fix_mistral_regex=True,
     )
 
     tokenizer.padding_size = "left" 
 
     if tokenizer.pad_token is None: 
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
     
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
@@ -161,7 +163,7 @@ def format_chat_prompt(
         )
     
 
-@torch.infernce_mode()  
+@torch.inference_mode()  
 def evaluate_model(
     model_path: str,
     examples,

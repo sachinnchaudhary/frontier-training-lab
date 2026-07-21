@@ -10,3 +10,6 @@ tensorboard
 pytest  
 matplotlib
 numpy
+
+wandb>=0.22.3
+hf_transfer>=0.1.9

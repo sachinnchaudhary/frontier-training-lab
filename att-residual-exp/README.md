@@ -172,6 +172,11 @@ processed; these are deliberately separate quantities. For example, after a
 positive 100M-token result, a 200M-token confirmation uses
 `--target-train-tokens 200000000`.
 
+Before interpreting the final 100M-token checkpoint losses, run the larger
+paired evaluation described in [COMMON_EVAL.md](COMMON_EVAL.md). It evaluates
+all six checkpoints on one deterministic manifest drawn from a previously
+untouched validation slice.
+
 ## Budget guidance
 
 Do not translate the $200 budget directly into a large grid before measuring

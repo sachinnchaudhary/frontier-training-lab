@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -206,6 +207,36 @@ class TransformerFunctions(nn.Module):
 
 def count_parameters(module: nn.Module) -> int:
     return sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def training_source_identity(entrypoint: Path) -> dict[str, object]:
+    candidates = (
+        entrypoint,
+        Path(__file__).resolve(),
+        ROOT / "att-residual-exp/attention_residual_baseline.py",
+        ROOT / "att-residual-exp/softmax_read_depth_kda.py",
+        ROOT / "att-residual-exp/associative_read_depth_kda.py",
+        ROOT / "model/layer.py",
+        ROOT / "model/rope.py",
+        ROOT / "data/pretokenized.py",
+    )
+    files = {
+        str(path.relative_to(ROOT) if path.is_relative_to(ROOT) else path): file_sha256(path)
+        for path in dict.fromkeys(candidates)
+        if path.is_file()
+    }
+    combined = hashlib.sha256(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {"files": files, "combined_sha256": combined}
 
 
 def mean_diagnostics(rows: list[dict[str, torch.Tensor | float]]) -> dict[str, float]:
@@ -433,6 +464,16 @@ def run_training(
     summary_path = run_dir / "summary.json"
 
     parameter_count = count_parameters(model)
+    entrypoint = Path(sys.argv[0]).resolve()
+    source_identity = training_source_identity(entrypoint)
+    cuda_device_name = (
+        torch.cuda.get_device_name(device) if device.type == "cuda" else None
+    )
+    cuda_device_capability = (
+        list(torch.cuda.get_device_capability(device))
+        if device.type == "cuda"
+        else None
+    )
     run_config = {
         "type": "run_config",
         **asdict(train_config),
@@ -443,6 +484,13 @@ def run_training(
         "depth_steps": 2 * model_config.num_layers,
         "precision_resolved": precision,
         "device": str(device),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "cuda_device_name": cuda_device_name,
+        "cuda_device_capability": cuda_device_capability,
+        "entrypoint": str(entrypoint),
+        "entrypoint_sha256": file_sha256(entrypoint),
+        "training_source_identity": source_identity,
         "training_tokens_target": train_config.training_tokens_target,
         **architecture_metadata,
     }
@@ -473,6 +521,18 @@ def run_training(
         for key in ("architecture", "dataset_name", "seq_len"):
             if previous[key] != run_config[key]:
                 raise ValueError(f"resume mismatch for {key}: {previous[key]} != {run_config[key]}")
+        if (
+            "entrypoint_sha256" in previous
+            and previous["entrypoint_sha256"] != run_config["entrypoint_sha256"]
+        ):
+            raise ValueError("resume entrypoint source hash does not match the checkpoint")
+        previous_source = previous.get("training_source_identity")
+        if (
+            isinstance(previous_source, dict)
+            and previous_source.get("combined_sha256")
+            != source_identity["combined_sha256"]
+        ):
+            raise ValueError("resume training-source hash does not match the checkpoint")
         if previous["model"] != run_config["model"]:
             raise ValueError("resume model configuration does not match")
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -512,8 +572,20 @@ def run_training(
 
     model.train()
     train_seconds = 0.0
+    architecture_diagnostics_seconds = 0.0
     interval_loss = 0.0
     interval_steps = 0
+    interval_gradient_norm_sum = 0.0
+    interval_gradient_norm_max = 0.0
+    interval_gradient_clipped_steps = 0
+    interval_nonfinite_gradient_steps = 0
+    total_gradient_steps = 0
+    total_gradient_clipped_steps = 0
+    total_nonfinite_gradient_steps = 0
+    maximum_gradient_norm = 0.0
+    final_train_evaluation_loss = float("nan")
+    final_validation_loss = float("nan")
+    evaluation_count = 0
     wall_start = time.perf_counter()
     print("run config:", json.dumps(run_config, default=str))
 
@@ -544,39 +616,119 @@ def run_training(
             step_loss += loss.detach().item() / train_config.grad_accum_steps
 
         scaler.unscale_(optimizer)
+        architecture_gradient_diagnostics: dict[str, float] = {}
+        step_architecture_diagnostics_seconds = 0.0
+        if step % train_config.log_interval == 0:
+            diagnostic_model = getattr(model, "_orig_mod", model)
+            diagnostic_callback = getattr(
+                diagnostic_model,
+                "gradient_diagnostics",
+                None,
+            )
+            if callable(diagnostic_callback):
+                # These grouped reductions are useful evidence, but they are
+                # instrumentation rather than architecture training work.
+                # Synchronize around them so tokens/sec remains comparable to
+                # runs that do not implement this optional callback.
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                diagnostics_start = time.perf_counter()
+                architecture_gradient_diagnostics = {
+                    key: float(value)
+                    for key, value in diagnostic_callback().items()
+                }
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                step_architecture_diagnostics_seconds = (
+                    time.perf_counter() - diagnostics_start
+                )
+                architecture_diagnostics_seconds += (
+                    step_architecture_diagnostics_seconds
+                )
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(),
             max_norm=train_config.max_grad_norm,
         )
+        grad_norm_value = float(grad_norm)
+        gradient_is_finite = math.isfinite(grad_norm_value)
+        gradient_was_clipped = (
+            gradient_is_finite and grad_norm_value > train_config.max_grad_norm
+        )
+        total_gradient_steps += 1
+        interval_gradient_norm_sum += grad_norm_value if gradient_is_finite else 0.0
+        interval_gradient_norm_max = max(
+            interval_gradient_norm_max,
+            grad_norm_value if gradient_is_finite else 0.0,
+        )
+        maximum_gradient_norm = max(
+            maximum_gradient_norm,
+            grad_norm_value if gradient_is_finite else 0.0,
+        )
+        if gradient_was_clipped:
+            interval_gradient_clipped_steps += 1
+            total_gradient_clipped_steps += 1
+        if not gradient_is_finite:
+            interval_nonfinite_gradient_steps += 1
+            total_nonfinite_gradient_steps += 1
         scaler.step(optimizer)
         scaler.update()
         if device.type == "cuda":
             torch.cuda.synchronize()
-        train_seconds += time.perf_counter() - step_start
+        train_seconds += (
+            time.perf_counter()
+            - step_start
+            - step_architecture_diagnostics_seconds
+        )
         interval_loss += step_loss
         interval_steps += 1
 
         if step % train_config.log_interval == 0:
             tokens_seen = step * train_config.tokens_per_step
+            session_tokens_seen = (
+                step - start_step + 1
+            ) * train_config.tokens_per_step
             log_row = {
                 "type": "train_log",
                 "step": step,
                 "train_loss_microbatch_mean": interval_loss / interval_steps,
                 "learning_rate": learning_rate,
-                "gradient_norm": float(grad_norm),
+                "gradient_norm": grad_norm_value,
+                "gradient_norm_interval_mean": interval_gradient_norm_sum
+                / max(interval_steps, 1),
+                "gradient_norm_interval_max": interval_gradient_norm_max,
+                "gradient_interval_steps": interval_steps,
+                "gradient_clipped_steps": interval_gradient_clipped_steps,
+                "gradient_clipping_fraction": interval_gradient_clipped_steps
+                / max(interval_steps, 1),
+                "nonfinite_gradient_steps": interval_nonfinite_gradient_steps,
                 "training_tokens_seen": tokens_seen,
-                "training_tokens_per_second": tokens_seen / max(train_seconds, 1e-8),
+                "session_training_tokens_seen": session_tokens_seen,
+                "training_tokens_per_second": session_tokens_seen
+                / max(train_seconds, 1e-8),
+                "training_seconds_elapsed": train_seconds,
+                "architecture_diagnostics_seconds_elapsed": (
+                    architecture_diagnostics_seconds
+                ),
+                "wall_seconds_elapsed": time.perf_counter() - wall_start,
+                **architecture_gradient_diagnostics,
             }
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(log_row) + "\n")
             print(json.dumps(log_row))
             interval_loss = 0.0
             interval_steps = 0
+            interval_gradient_norm_sum = 0.0
+            interval_gradient_norm_max = 0.0
+            interval_gradient_clipped_steps = 0
+            interval_nonfinite_gradient_steps = 0
 
         should_evaluate = step % train_config.eval_interval == 0 or step == train_config.max_steps
         if should_evaluate:
             train_loss, _ = evaluate(model, train_eval_batches, device, precision)
             val_loss, diagnostics = evaluate(model, val_eval_batches, device, precision)
+            final_train_evaluation_loss = train_loss
+            final_validation_loss = val_loss
+            evaluation_count += 1
             eval_row = {
                 "type": "eval_log",
                 "step": step,
@@ -584,11 +736,23 @@ def run_training(
                 "validation_loss": val_loss,
                 "best_validation_loss": min(best_val_loss, val_loss),
                 "training_tokens_seen": step * train_config.tokens_per_step,
+                "training_seconds_elapsed": train_seconds,
+                "wall_seconds_elapsed": time.perf_counter() - wall_start,
                 **diagnostics,
             }
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(eval_row) + "\n")
-            print(json.dumps(eval_row))
+            # Retain per-depth diagnostics in logs.jsonl without flooding a
+            # remote terminal with hundreds of fields at every evaluation.
+            console_eval_row = {
+                key: value
+                for key, value in eval_row.items()
+                if not key.startswith("depth_")
+            }
+            console_eval_row["depth_diagnostics_in_log"] = sum(
+                key.startswith("depth_") for key in eval_row
+            )
+            print(json.dumps(console_eval_row))
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_step = step
@@ -614,18 +778,40 @@ def run_training(
             )
 
     wall_seconds = time.perf_counter() - wall_start
+    session_training_tokens = (
+        train_config.max_steps - start_step + 1
+    ) * train_config.tokens_per_step
     summary = {
         **run_config,
         "type": "summary",
         "best_validation_loss": best_val_loss,
         "best_step": best_step,
+        "final_train_evaluation_loss": final_train_evaluation_loss,
+        "final_validation_loss": final_validation_loss,
+        "evaluation_count": evaluation_count,
         "wall_seconds": wall_seconds,
         "training_seconds": train_seconds,
-        "training_tokens_per_second": train_config.training_tokens_target
+        "architecture_diagnostics_seconds": architecture_diagnostics_seconds,
+        "session_training_tokens": session_training_tokens,
+        "training_tokens_per_second": session_training_tokens
         / max(train_seconds, 1e-8),
+        "training_timing_scope": (
+            "current_process_session_excluding_evaluation_checkpointing_"
+            "and_optional_architecture_diagnostics"
+        ),
         "peak_cuda_memory_bytes": torch.cuda.max_memory_allocated()
         if device.type == "cuda"
         else 0,
+        "peak_cuda_memory_reserved_bytes": torch.cuda.max_memory_reserved()
+        if device.type == "cuda"
+        else 0,
+        "gradient_statistics_scope": "current_process_session",
+        "gradient_steps_observed": total_gradient_steps,
+        "gradient_clipped_steps": total_gradient_clipped_steps,
+        "gradient_clipping_fraction": total_gradient_clipped_steps
+        / max(total_gradient_steps, 1),
+        "nonfinite_gradient_steps": total_nonfinite_gradient_steps,
+        "maximum_gradient_norm": maximum_gradient_norm,
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary

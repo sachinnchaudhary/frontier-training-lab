@@ -1,6 +1,6 @@
-# Attention Residual vs. Softmax-Read Gated-Delta Depth Memory
+# Attention Residual and Depth-KDA Reader Experiments
 
-This directory contains a controlled language-model experiment with two entry
+This directory contains controlled language-model experiments with three entry
 points:
 
 - `attention_residual_baseline.py`: Full Attention Residuals over Transformer
@@ -10,6 +10,9 @@ points:
   Kimi Delta Attention sequence layer. The gated delta recurrence is applied
   across Transformer sublayers, while ordinary causal attention still mixes
   tokens along the sequence.
+- `associative_read_depth_kda.py`: the reader-only ablation. It retains the
+  same depth writer and ordinary residual backbone, but reads the state with
+  the native signed KDA operation `Z^T q` instead of softmax over state rows.
 
 Both models share the tokenizer, data loader, causal self-attention, RoPE,
 normalization, feed-forward implementation, optimizer, scheduler, evaluation,
@@ -95,6 +98,27 @@ Initial writer settings are `alpha ~= 0.99` and `beta ~= 0.119`; the memory
 read gate starts at `gamma = 1e-3`. The reference state and recurrence are kept
 in FP32 even when the surrounding model uses BF16 autocast.
 
+### Direct Associative-Read Depth KDA
+
+The direct-reader ablation leaves the update above unchanged and replaces only
+the read path:
+
+```text
+q_j = L2Norm(W_q RMSNorm(u_j))
+o_j = (Z_j^T q_j) / sqrt(S)
+h_j = u_j + gamma_j W_o(o_j)
+```
+
+The updated state is still read after the current delta is written. There is
+no output RMSNorm, data-dependent output gate, learned KDA timescale, top-k, or
+controller sharing in this ablation. Those are deliberately separate future
+changes.
+
+Because the read is signed, the model logs query energy support, cancellation,
+state effective rank, and an exact decomposition into history and current-write
+contributions. It also retains selected metrics separately for all `2L - 1`
+live transitions instead of hiding them in one depth average.
+
 ## Parameter matching
 
 By default, the proposal constructs the corresponding Full Attention Residual
@@ -105,13 +129,26 @@ width, and remaining parameter difference are written to each run's config.
 
 Use `--no-param-match` only for the explicit equal-backbone-width ablation.
 
+The primary associative-reader experiment follows a different rule: it pins
+the exact FFN width selected for the softmax reader. The direct model is
+therefore smaller, and the reader is the only architectural change. Do not pass
+`--parameter-match-attnres` for the primary three-seed run; that flag is for a
+later equal-total-parameter follow-up.
+
+Equal seeds alone are not sufficient for paired initialization because the
+smaller reader changes the random-number stream used by later modules. The
+entry point therefore reconstructs the seed-matched softmax control and copies
+every same-name, same-shape shared tensor into the direct model. Only the
+shape-incompatible direct query projections retain reader-specific random
+initialization; this is recorded in `config.json`.
+
 The included presets use a 1,024-token vocabulary and SwiGLU FFNs:
 
-| Mode | Width | Blocks / depth steps | Heads | Sequence | Baseline FFN / params | Matched proposal FFN / params | Training target |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `smoke` | 64 | 3 / 6 | 4 | 24 | 128 / 256,128 | 48 / 256,146 | synthetic check |
-| `pilot` | 256 | 8 / 16 | 4 | 256 | 768 / 7,366,912 | 693 / 7,369,446 | 20M sampled tokens |
-| `full` | 384 | 12 / 24 | 6 | 512 | 1,024 / 22,077,312 | 949 / 22,083,550 | 100M sampled tokens |
+| Mode | Width | Blocks / depth steps | Heads | Sequence | Baseline FFN / params | Softmax FFN / params | Direct FFN / params | Training target |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `smoke` | 64 | 3 / 6 | 4 | 24 | 128 / 256,128 | 48 / 256,146 | 48 / 237,970 | synthetic check |
+| `pilot` | 256 | 8 / 16 | 4 | 256 | 768 / 7,366,912 | 693 / 7,369,446 | 693 / 7,246,310 | 20M sampled tokens |
+| `full` | 384 | 12 / 24 | 6 | 512 | 1,024 / 22,077,312 | 949 / 22,083,550 | 949 / 21,824,222 | 100M sampled tokens |
 
 The 12-block, roughly 22M-parameter preset is the recommended first serious
 comparison: it is large enough to expose a meaningful depth bottleneck while
@@ -137,6 +174,7 @@ Each entry point also has a lightweight built-in smoke mode:
 ```powershell
 python att-residual-exp/attention_residual_baseline.py --mode smoke
 python att-residual-exp/softmax_read_depth_kda.py --mode smoke
+python att-residual-exp/associative_read_depth_kda.py --mode smoke
 ```
 
 ## Training commands
@@ -156,6 +194,7 @@ Before a full run, benchmark 500 optimization steps on the exact rented GPU:
 ```powershell
 python att-residual-exp/attention_residual_baseline.py --mode full --dataset parameter_golf_sp1024 --max-steps 500 --run-name throughput_baseline
 python att-residual-exp/softmax_read_depth_kda.py --mode full --dataset parameter_golf_sp1024 --max-steps 500 --run-name throughput_proposal
+python att-residual-exp/associative_read_depth_kda.py --mode full --dataset parameter_golf_sp1024 --max-steps 500 --run-name throughput_associative
 ```
 
 Then run the paired full comparison. Repeat the same commands with at least
@@ -165,6 +204,29 @@ three seeds for a result intended to support a claim.
 python att-residual-exp/attention_residual_baseline.py --mode full --dataset parameter_golf_sp1024 --seed 1337 --run-name full_seed1337
 python att-residual-exp/softmax_read_depth_kda.py --mode full --dataset parameter_golf_sp1024 --seed 1337 --run-name full_seed1337
 ```
+
+For the reader-only comparison, reuse the existing softmax checkpoints and run
+the associative model at the same three seeds and 100M-token budget:
+
+```powershell
+python -u att-residual-exp/associative_read_depth_kda.py --mode full --dataset parameter_golf_sp1024 --precision bf16 --seed 1337 --target-train-tokens 100000000 --checkpoint-interval 500 --run-name full_100m_seed1337
+python -u att-residual-exp/associative_read_depth_kda.py --mode full --dataset parameter_golf_sp1024 --precision bf16 --seed 2027 --target-train-tokens 100000000 --checkpoint-interval 500 --run-name full_100m_seed2027
+python -u att-residual-exp/associative_read_depth_kda.py --mode full --dataset parameter_golf_sp1024 --precision bf16 --seed 3407 --target-train-tokens 100000000 --checkpoint-interval 500 --run-name full_100m_seed3407
+```
+
+Each run has 12,208 optimizer steps and processes 100,007,936 tokens because
+one step contains 8,192 tokens.
+
+On RunPod, the resumable serial launcher is less error-prone than pasting three
+long commands:
+
+```bash
+nohup bash att-residual-exp/run_associative_100m.sh > /workspace/attres-associative-100m.log 2>&1 &
+tail -f /workspace/attres-associative-100m.log
+```
+
+It skips completed seeds and resumes a seed when `checkpoints/latest.pt`
+exists. Run only one launcher per GPU.
 
 `--max-encoded-tokens` limits the corpus loaded into memory.
 `--target-train-tokens` controls how many sampled training tokens are actually
@@ -176,6 +238,25 @@ Before interpreting the final 100M-token checkpoint losses, run the larger
 paired evaluation described in [COMMON_EVAL.md](COMMON_EVAL.md). It evaluates
 all six checkpoints on one deterministic manifest drawn from a previously
 untouched validation slice.
+
+For the reader ablation, use `evaluate_checkpoints.py --comparison reader`.
+Besides paired common-manifest NLL, it evaluates every checkpoint again with
+all memory-output gammas set to zero. This guards against declaring a reader
+successful when the ordinary residual backbone learned to ignore its memory.
+
+The direct reader is promoted when its paired NLL is noninferior at the
+predeclared `0.01` margin, it improves at least one cleanly measured efficiency
+metric without an operationally meaningful regression in the others, its
+memory-off penalty is positive in every seed, and all three runs finish without
+non-finite gradients or failures. Query support, signed cancellation,
+effective rank, and update ratios are explanatory diagnostics; they determine
+the next ablation but are not post-hoc pass/fail thresholds.
+
+Grouped reader/writer gradient reductions are timed separately and excluded
+from `training_tokens_per_second`. Their time is logged as
+`architecture_diagnostics_seconds`. Use the 500-step probes for the clean
+hardware-speed comparison; total wall time still includes diagnostics,
+evaluation, and checkpointing.
 
 ## Budget guidance
 
@@ -207,10 +288,12 @@ sweeps, and other architecture changes out of the first paired comparison.
 Runs are written under `att-residual-exp/runs/<architecture>/<run-name>/`:
 
 - `config.json`: resolved model/training configuration and architecture metadata;
-- `logs.jsonl`: training loss, validation loss, throughput, and memory-routing diagnostics;
+- `logs.jsonl`: training/validation loss, throughput, clipping and gradient-group
+  statistics, aggregate memory diagnostics, and direct-reader depth profiles;
 - `checkpoints/best.pt`: best validation checkpoint;
 - `checkpoints/latest.pt`: rotating resumable checkpoint;
-- `summary.json`: best result, timing, token throughput, and peak CUDA memory.
+- `summary.json`: best result, timing, token throughput, stability counters, and
+  peak allocated and reserved CUDA memory.
 
 The `runs` directory ignores generated artifacts in Git while retaining its
 placeholder `.gitignore`.

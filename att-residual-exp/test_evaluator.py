@@ -19,8 +19,10 @@ from pathlib import Path
 import torch
 
 from _common import ModelConfig, count_parameters
+from associative_read_depth_kda import AssociativeReadDepthKDALM
 from attention_residual_baseline import FullAttentionResidualLM
 from evaluate_checkpoints import (
+    ASSOCIATIVE_ARCHITECTURE,
     BASELINE_ARCHITECTURE,
     BLOCK_TARGET_TOKENS,
     EXPECTED_DEFAULT_BLOCK_IDS_SHA256,
@@ -35,6 +37,7 @@ from evaluate_checkpoints import (
     CheckpointSpec,
     block_ids_sha256,
     construct_model,
+    disable_memory_reads,
     evaluate_model,
     load_checkpoint_model,
     normalize_state_dict,
@@ -78,6 +81,25 @@ def proposal_config(model_config: ModelConfig, model: torch.nn.Module, seed: int
             "gamma_init": 0.002,
             "reference_attnres_ffn_hidden_dim": 999,
             "matched_ffn_hidden_dim": model_config.ffn_hidden_dim,
+        }
+    )
+    return config
+
+
+def associative_config(
+    model_config: ModelConfig,
+    model: torch.nn.Module,
+    seed: int,
+) -> dict:
+    config = baseline_config(model_config, model, seed)
+    config.update(
+        {
+            "architecture": ASSOCIATIVE_ARCHITECTURE,
+            "num_slots": 3,
+            "memory_dim": 7,
+            "alpha_bias": -3.7,
+            "beta_bias": -1.4,
+            "gamma_init": 0.002,
         }
     )
     return config
@@ -196,6 +218,31 @@ def check_checkpoint_roundtrips() -> None:
             token_ids,
             compiled_prefix=True,
         )
+
+        associative = AssociativeReadDepthKDALM(
+            proposal_model_config,
+            num_slots=3,
+            memory_dim=7,
+            alpha_bias=-3.7,
+            beta_bias=-1.4,
+            gamma_init=0.002,
+        )
+        associative_run_config = associative_config(
+            proposal_model_config,
+            associative,
+            seed=13,
+        )
+        assert_roundtrip(
+            root,
+            associative,
+            associative_run_config,
+            token_ids,
+        )
+        transition_count = disable_memory_reads(associative)
+        if transition_count != 2 * proposal_model_config.num_layers - 1:
+            raise AssertionError("memory-off intervention changed the wrong transition count")
+        if any(transition.gamma.item() != 0.0 for transition in associative.transitions):
+            raise AssertionError("memory-off intervention left a nonzero gamma")
 
 
 def check_fail_closed_behavior() -> None:
@@ -366,6 +413,40 @@ def check_comparison_summary() -> None:
     if summary["delta_definition"].split(";")[1].strip() != "negative favors proposal":
         raise AssertionError("comparison delta direction is unclear")
 
+    reader_records = []
+    for seed in seeds:
+        softmax = fake_record(PROPOSAL_ARCHITECTURE, seed, 2.70, manifest)
+        associative = fake_record(ASSOCIATIVE_ARCHITECTURE, seed, 2.705, manifest)
+        softmax["memory_off"] = fake_record(
+            PROPOSAL_ARCHITECTURE,
+            seed,
+            2.80,
+            manifest,
+        )
+        associative["memory_off"] = fake_record(
+            ASSOCIATIVE_ARCHITECTURE,
+            seed,
+            2.755,
+            manifest,
+        )
+        reader_records.extend((softmax, associative))
+    reader_summary = summarize_comparison(
+        reader_records,
+        seeds=seeds,
+        manifest=manifest,
+        bootstrap_samples=100,
+        bootstrap_seed=9,
+        practical_margin=0.01,
+        architectures=(PROPOSAL_ARCHITECTURE, ASSOCIATIVE_ARCHITECTURE),
+        control_architecture=PROPOSAL_ARCHITECTURE,
+        candidate_architecture=ASSOCIATIVE_ARCHITECTURE,
+    )
+    if reader_summary["candidate_architecture"] != ASSOCIATIVE_ARCHITECTURE:
+        raise AssertionError("reader comparison candidate was mislabeled")
+    intervention = reader_summary["memory_off_causal_intervention"]
+    if not intervention[ASSOCIATIVE_ARCHITECTURE]["all_seeds_positive"]:
+        raise AssertionError("memory-off penalties were not summarized")
+
 
 class UniformLanguageModel(torch.nn.Module):
     def __init__(self, vocab_size: int):
@@ -464,6 +545,7 @@ def main() -> None:
                 "checks": [
                     "baseline_checkpoint_roundtrip",
                     "proposal_nondefault_compiled_checkpoint_roundtrip",
+                    "associative_checkpoint_roundtrip_and_memory_off_intervention",
                     "fail_closed_dispatch_and_strict_state_loading",
                     "frozen_untouched_pool_manifest_selection",
                     "paired_comparison_summary",

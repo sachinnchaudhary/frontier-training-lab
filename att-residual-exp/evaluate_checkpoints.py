@@ -1,13 +1,15 @@
-"""Common-manifest evaluation for the AttnRes depth-memory experiment.
+"""Common-manifest evaluation for AttnRes and depth-reader experiments.
 
 Run from the repository root after the paired 100M-token runs finish:
 
     python -u att-residual-exp/evaluate_checkpoints.py --resume
+    python -u att-residual-exp/evaluate_checkpoints.py --comparison reader --resume
 
 The training harness repeatedly evaluated the first 10M validation tokens.
-This script instead samples fixed, non-overlapping scoring blocks from the
-previously untouched validation-token slice [10M, 20M). Every checkpoint sees
-the exact same blocks in the exact same order.
+The original AttnRes comparison uses [10M, 20M). The later reader ablation
+uses a separately frozen [20M, 30M) slice that was not inspected by the prior
+common evaluation. Every checkpoint in one comparison sees the exact same
+blocks in the exact same order.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ import torch.nn.functional as F
 from scipy.stats import t as student_t
 
 from _common import ModelConfig, autocast_context, count_parameters, resolve_precision
+from associative_read_depth_kda import AssociativeReadDepthKDALM
 from attention_residual_baseline import FullAttentionResidualLM
 from softmax_read_depth_kda import SoftmaxReadGatedDeltaDepthMemoryLM
 
@@ -45,8 +48,41 @@ ROOT = Path(__file__).resolve().parents[1]
 
 BASELINE_ARCHITECTURE = "full_attention_residual"
 PROPOSAL_ARCHITECTURE = "softmax_read_gated_delta_depth_memory"
+ASSOCIATIVE_ARCHITECTURE = "associative_read_depth_kda"
 DEFAULT_ARCHITECTURES = (BASELINE_ARCHITECTURE, PROPOSAL_ARCHITECTURE)
 DEFAULT_SEEDS = (1337, 2027, 3407)
+COMPARISON_PLANS = {
+    "attnres": {
+        "control": BASELINE_ARCHITECTURE,
+        "candidate": PROPOSAL_ARCHITECTURE,
+        "output_dir": "common_eval_4m_seed424242",
+        "memory_off_intervention": False,
+        "pool_start_token": 10_000_000,
+        "expected_pool_sha256": (
+            "503a67ddea82a04bebf57cdfb3ce88dd002693e134eac745553f0190b15fea34"
+        ),
+        "expected_block_ids_sha256": (
+            "6084f8386ab45dc508b3b9405e98b3b45dadd79c3bdc258816521ec3f059d22c"
+        ),
+        "pool_status": "not used by the training harness validation sampler",
+    },
+    "reader": {
+        "control": PROPOSAL_ARCHITECTURE,
+        "candidate": ASSOCIATIVE_ARCHITECTURE,
+        "output_dir": "common_eval_reader_4m_seed424242",
+        "memory_off_intervention": True,
+        "pool_start_token": 20_000_000,
+        "expected_pool_sha256": (
+            "6295b2db17d16427efbeb6355ffcdbac17a84d7289cd886c3c17227cce39cea6"
+        ),
+        "expected_block_ids_sha256": (
+            "61a2e237a7f43fef93dc630d6f5f866f5632baf2f557d67cb3c834d8a8fca3f7"
+        ),
+        "pool_status": (
+            "not used by training or the prior AttnRes common evaluation"
+        ),
+    },
+}
 
 DATASET_NAME = "parameter_golf_sp1024"
 VALIDATION_SHARD = ROOT / "data/datasets/fineweb10B_sp1024/fineweb_val_000000.bin"
@@ -67,10 +103,26 @@ SELECTION_PREFIX = bytes.fromhex(
 EXPECTED_DEFAULT_BLOCK_IDS_SHA256 = (
     "6084f8386ab45dc508b3b9405e98b3b45dadd79c3bdc258816521ec3f059d22c"
 )
+POOL_STATUS = "not used by the training harness validation sampler"
 
 MANIFEST_SCHEMA = "attres-common-eval-v1"
 RESULT_SCHEMA = "attres-common-eval-result-v1"
 COMPARISON_SCHEMA = "attres-common-eval-comparison-v1"
+
+
+def configure_validation_pool(plan: Mapping[str, Any]) -> None:
+    """Select the frozen validation slice belonging to one comparison plan."""
+    global POOL_START_TOKEN
+    global EXPECTED_POOL_SHA256
+    global EXPECTED_DEFAULT_BLOCK_IDS_SHA256
+    global POOL_STATUS
+
+    POOL_START_TOKEN = int(plan["pool_start_token"])
+    EXPECTED_POOL_SHA256 = str(plan["expected_pool_sha256"])
+    EXPECTED_DEFAULT_BLOCK_IDS_SHA256 = str(
+        plan["expected_block_ids_sha256"]
+    )
+    POOL_STATUS = str(plan["pool_status"])
 
 
 @dataclass(frozen=True)
@@ -254,7 +306,7 @@ def build_manifest(
             "token_count": POOL_TOKEN_COUNT,
             "end_token_exclusive": pool_end,
             "raw_uint16_le_sha256": pool_sha256,
-            "status_before_this_evaluation": "not used by the training harness validation sampler",
+            "status_before_this_evaluation": POOL_STATUS,
         },
         "sampling": {
             "algorithm": "sha256_rank_without_replacement",
@@ -338,6 +390,7 @@ def source_code_identity() -> dict[str, Any]:
         ROOT / "att-residual-exp/_common.py",
         ROOT / "att-residual-exp/attention_residual_baseline.py",
         ROOT / "att-residual-exp/softmax_read_depth_kda.py",
+        ROOT / "att-residual-exp/associative_read_depth_kda.py",
         ROOT / "model/layer.py",
         ROOT / "model/rope.py",
         ROOT / "data/pretokenized.py",
@@ -440,6 +493,7 @@ def validate_run_matrix(
         "warmup_steps",
         "max_grad_norm",
         "precision_resolved",
+        "compile_model",
         "training_tokens_target",
     )
     reference = specs[0].run_config
@@ -485,6 +539,67 @@ def validate_run_matrix(
             raise ValueError(f"seed {seed} does not have one checkpoint per architecture")
 
 
+def validate_reader_ablation_matrix(
+    specs: Sequence[CheckpointSpec],
+    seeds: Sequence[int],
+) -> None:
+    """Fail closed unless the reader is the intended causal difference."""
+    by_pair = {(spec.architecture, spec.seed): spec.run_config for spec in specs}
+    shared_writer_keys = (
+        "num_slots",
+        "memory_dim",
+        "alpha_bias",
+        "beta_bias",
+        "gamma_init",
+        "depth_memory_granularity",
+        "depth_memory_state_scope",
+        "depth_memory_write",
+    )
+    for seed in seeds:
+        softmax = by_pair[(PROPOSAL_ARCHITECTURE, seed)]
+        associative = by_pair[(ASSOCIATIVE_ARCHITECTURE, seed)]
+        softmax_model = softmax.get("model")
+        associative_model = associative.get("model")
+        if not isinstance(softmax_model, dict) or not isinstance(associative_model, dict):
+            raise ValueError(f"seed {seed} is missing a model configuration")
+        if softmax_model != associative_model:
+            raise ValueError(
+                f"reader ablation seed {seed} has unequal backbone/model configurations"
+            )
+        for key in shared_writer_keys:
+            if softmax.get(key) != associative.get(key):
+                raise ValueError(
+                    f"reader ablation seed {seed} has unequal writer setting {key}: "
+                    f"{softmax.get(key)!r} != {associative.get(key)!r}"
+                )
+        if int(softmax.get("read_key_dim", -1)) != int(
+            associative.get("softmax_control_read_key_dim", -2)
+        ) or int(softmax.get("read_value_dim", -1)) != int(
+            associative.get("softmax_control_read_value_dim", -2)
+        ):
+            raise ValueError("associative run was initialized from the wrong softmax reader")
+        if associative.get("parameter_matching") != "softmax_reader_control_backbone":
+            raise ValueError(
+                "primary reader ablation must pin the softmax control backbone width"
+            )
+        if associative.get("shared_initialization_from_softmax_control") is not True:
+            raise ValueError(
+                "associative checkpoint did not use paired shared-parameter initialization"
+            )
+        if int(associative.get("softmax_control_ffn_hidden_dim", -1)) != int(
+            associative_model.get("ffn_hidden_dim", -2)
+        ):
+            raise ValueError("associative checkpoint did not retain the control FFN width")
+        if int(associative.get("model_parameters", -1)) >= int(
+            softmax.get("model_parameters", -1)
+        ):
+            raise ValueError("associative reader was expected to use fewer parameters")
+        if int(associative.get("softmax_control_parameters", -1)) != int(
+            softmax.get("model_parameters", -2)
+        ):
+            raise ValueError("associative run recorded the wrong softmax control size")
+
+
 def normalize_state_dict(state_dict: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     keys = list(state_dict)
     if not keys:
@@ -527,6 +642,27 @@ def construct_model(run_config: Mapping[str, Any]) -> torch.nn.Module:
             memory_dim=int(run_config["memory_dim"]),
             read_key_dim=int(run_config["read_key_dim"]),
             read_value_dim=int(run_config["read_value_dim"]),
+            alpha_bias=float(run_config["alpha_bias"]),
+            beta_bias=float(run_config["beta_bias"]),
+            gamma_init=float(run_config["gamma_init"]),
+        )
+    elif architecture == ASSOCIATIVE_ARCHITECTURE:
+        required = (
+            "num_slots",
+            "memory_dim",
+            "alpha_bias",
+            "beta_bias",
+            "gamma_init",
+        )
+        missing = [key for key in required if key not in run_config]
+        if missing:
+            raise ValueError(
+                f"associative checkpoint is missing reconstruction fields: {missing}"
+            )
+        model = AssociativeReadDepthKDALM(
+            model_config,
+            num_slots=int(run_config["num_slots"]),
+            memory_dim=int(run_config["memory_dim"]),
             alpha_bias=float(run_config["alpha_bias"]),
             beta_bias=float(run_config["beta_bias"]),
             gamma_init=float(run_config["gamma_init"]),
@@ -859,6 +995,50 @@ def evaluate_model(
     }
 
 
+@torch.no_grad()
+def disable_memory_reads(model: torch.nn.Module) -> int:
+    """Set every depth-memory output gamma to zero for a causal intervention."""
+    transitions = getattr(model, "transitions", None)
+    if transitions is None:
+        raise TypeError("memory-off intervention requires a model.transitions collection")
+    count = 0
+    for transition in transitions:
+        gamma = getattr(transition, "gamma", None)
+        if not isinstance(gamma, torch.nn.Parameter) or gamma.numel() != 1:
+            raise TypeError("memory transition is missing its scalar gamma parameter")
+        gamma.zero_()
+        count += 1
+    if count == 0:
+        raise ValueError("memory-off intervention found no live transitions")
+    config = getattr(model, "config", None)
+    num_layers = getattr(config, "num_layers", None)
+    if not isinstance(num_layers, int):
+        raise TypeError("memory-off intervention could not determine model depth")
+    expected_count = 2 * num_layers - 1
+    if count != expected_count:
+        raise ValueError(
+            f"memory-off intervention found {count} transitions, "
+            f"expected {expected_count}"
+        )
+    return count
+
+
+def validate_metric_payload(
+    metrics: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> None:
+    """Apply the full result-integrity checks to a nested intervention payload."""
+    validate_completed_result(
+        {
+            "schema": RESULT_SCHEMA,
+            "status": "complete",
+            "manifest_sha256": manifest["manifest_sha256"],
+            **metrics,
+        },
+        manifest,
+    )
+
+
 def require_close(label: str, actual: Any, expected: float) -> None:
     value = float(actual)
     if not math.isfinite(value) or not math.isclose(value, expected, rel_tol=1e-12, abs_tol=1e-9):
@@ -978,17 +1158,23 @@ def summarize_comparison(
     bootstrap_samples: int,
     bootstrap_seed: int,
     practical_margin: float,
+    architectures: Sequence[str] = DEFAULT_ARCHITECTURES,
+    control_architecture: str = BASELINE_ARCHITECTURE,
+    candidate_architecture: str = PROPOSAL_ARCHITECTURE,
 ) -> dict[str, Any]:
+    architectures = tuple(architectures)
+    if set(architectures) != {control_architecture, candidate_architecture}:
+        raise ValueError("comparison architectures must match control and candidate")
     completed = [record for record in records if record.get("status") == "complete"]
     for record in completed:
         validate_completed_result(record, manifest)
     by_pair = {(str(record["architecture"]), int(record["seed"])): record for record in completed}
-    expected = {(architecture, seed) for architecture in DEFAULT_ARCHITECTURES for seed in seeds}
+    expected = {(architecture, seed) for architecture in architectures for seed in seeds}
     if set(by_pair) != expected:
         raise ValueError(f"cannot compare incomplete result matrix: {sorted(set(expected) - set(by_pair))}")
 
     architecture_summaries: dict[str, Any] = {}
-    for architecture in DEFAULT_ARCHITECTURES:
+    for architecture in architectures:
         losses = [float(by_pair[(architecture, seed)]["mean_nll"]) for seed in seeds]
         architecture_summaries[architecture] = {
             "mean_nll_by_seed": losses,
@@ -1000,25 +1186,30 @@ def summarize_comparison(
     paired_rows: list[dict[str, Any]] = []
     paired_block_differences: list[list[float]] = []
     for seed in seeds:
-        baseline = by_pair[(BASELINE_ARCHITECTURE, seed)]
-        proposal = by_pair[(PROPOSAL_ARCHITECTURE, seed)]
-        baseline_blocks = {int(row["block_id"]): row for row in baseline["blocks"]}
-        proposal_blocks = {int(row["block_id"]): row for row in proposal["blocks"]}
-        if list(sorted(baseline_blocks)) != list(sorted(proposal_blocks)):
+        control = by_pair[(control_architecture, seed)]
+        candidate = by_pair[(candidate_architecture, seed)]
+        control_blocks = {int(row["block_id"]): row for row in control["blocks"]}
+        candidate_blocks = {int(row["block_id"]): row for row in candidate["blocks"]}
+        if list(sorted(control_blocks)) != list(sorted(candidate_blocks)):
             raise ValueError(f"paired block IDs differ for seed {seed}")
         block_differences = [
-            (float(proposal_blocks[block_id]["nll_sum"]) - float(baseline_blocks[block_id]["nll_sum"]))
+            (
+                float(candidate_blocks[block_id]["nll_sum"])
+                - float(control_blocks[block_id]["nll_sum"])
+            )
             / BLOCK_TARGET_TOKENS
-            for block_id in sorted(baseline_blocks)
+            for block_id in sorted(control_blocks)
         ]
         paired_block_differences.append(block_differences)
-        delta = float(proposal["mean_nll"]) - float(baseline["mean_nll"])
+        delta = float(candidate["mean_nll"]) - float(control["mean_nll"])
         paired_rows.append(
             {
                 "seed": seed,
-                "baseline_mean_nll": float(baseline["mean_nll"]),
-                "proposal_mean_nll": float(proposal["mean_nll"]),
-                "proposal_minus_baseline": delta,
+                "control_architecture": control_architecture,
+                "candidate_architecture": candidate_architecture,
+                "control_mean_nll": float(control["mean_nll"]),
+                "candidate_mean_nll": float(candidate["mean_nll"]),
+                "candidate_minus_control": delta,
                 "conditional_block_bootstrap_95_ci": bootstrap_interval(
                     np.asarray(block_differences, dtype=np.float64),
                     bootstrap_samples,
@@ -1028,7 +1219,7 @@ def summarize_comparison(
         )
 
     seed_deltas = np.asarray(
-        [row["proposal_minus_baseline"] for row in paired_rows], dtype=np.float64
+        [row["candidate_minus_control"] for row in paired_rows], dtype=np.float64
     )
     seed_count = len(seed_deltas)
     mean_delta = float(seed_deltas.mean())
@@ -1062,22 +1253,76 @@ def summarize_comparison(
         mean_delta + fixed_pool_critical * finite_population_se,
     ]
 
+    memory_off_summaries: dict[str, Any] = {}
+    for architecture in architectures:
+        architecture_records = [by_pair[(architecture, seed)] for seed in seeds]
+        interventions = [record.get("memory_off") for record in architecture_records]
+        if any(intervention is not None for intervention in interventions):
+            if not all(isinstance(intervention, dict) for intervention in interventions):
+                raise ValueError(
+                    f"memory-off results are incomplete for architecture {architecture}"
+                )
+            penalties = []
+            for record, intervention in zip(architecture_records, interventions):
+                assert isinstance(intervention, dict)
+                validate_metric_payload(intervention, manifest)
+                penalties.append(
+                    float(intervention["mean_nll"]) - float(record["mean_nll"])
+                )
+            memory_off_summaries[architecture] = {
+                "definition": "memory-off mean NLL minus normal mean NLL; positive means memory helps",
+                "penalty_by_seed": penalties,
+                "mean_penalty": statistics.fmean(penalties),
+                "sample_sd_across_training_seeds": statistics.stdev(penalties),
+                "positive_seed_count": sum(value > 0.0 for value in penalties),
+                "all_seeds_positive": all(value > 0.0 for value in penalties),
+            }
+
+    legacy_names = (
+        control_architecture == BASELINE_ARCHITECTURE
+        and candidate_architecture == PROPOSAL_ARCHITECTURE
+    )
+    if legacy_names:
+        for row in paired_rows:
+            row.update(
+                {
+                    "baseline_mean_nll": row["control_mean_nll"],
+                    "proposal_mean_nll": row["candidate_mean_nll"],
+                    "proposal_minus_baseline": row["candidate_minus_control"],
+                }
+            )
     if training_seed_ci[1] < -practical_margin:
-        verdict = "proposal_practically_superior"
+        verdict = "proposal_practically_superior" if legacy_names else "candidate_practically_superior"
     elif training_seed_ci[0] > practical_margin:
-        verdict = "baseline_practically_superior"
+        verdict = "baseline_practically_superior" if legacy_names else "control_practically_superior"
     elif noninferiority_upper < practical_margin:
-        verdict = "proposal_noninferior_at_declared_margin"
+        verdict = (
+            "proposal_noninferior_at_declared_margin"
+            if legacy_names
+            else "candidate_noninferior_at_declared_margin"
+        )
     else:
         verdict = "inconclusive_add_paired_training_seeds"
+
+    delta_definition = (
+        "proposal mean NLL minus baseline mean NLL; negative favors proposal"
+        if legacy_names
+        else (
+            f"{candidate_architecture} mean NLL minus {control_architecture} mean NLL; "
+            f"negative favors {candidate_architecture}"
+        )
+    )
 
     return {
         "schema": COMPARISON_SCHEMA,
         "created_utc": utc_now(),
         "manifest_sha256": manifest["manifest_sha256"],
-        "delta_definition": "proposal mean NLL minus baseline mean NLL; negative favors proposal",
+        "control_architecture": control_architecture,
+        "candidate_architecture": candidate_architecture,
+        "delta_definition": delta_definition,
         "architecture_summaries": architecture_summaries,
         "paired_by_training_seed": paired_rows,
+        "memory_off_causal_intervention": memory_off_summaries,
         "paired_training_seed_inference_primary": {
             "training_seed_count": seed_count,
             "mean_delta": mean_delta,
@@ -1104,8 +1349,8 @@ def summarize_comparison(
         "decision": {
             "practical_margin_nll": practical_margin,
             "rule": (
-                "two-sided seed CI entirely below -margin: proposal superior; entirely above "
-                "+margin: baseline superior; one-sided 95% upper bound below +margin: proposal "
+                "two-sided seed CI entirely below -margin: candidate superior; entirely above "
+                "+margin: control superior; one-sided 95% upper bound below +margin: candidate "
                 "noninferior; otherwise inconclusive"
             ),
             "verdict": verdict,
@@ -1131,6 +1376,8 @@ def write_results_csv(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
         "nll_sum",
         "mean_nll",
         "perplexity",
+        "memory_off_mean_nll",
+        "memory_off_penalty_nll",
         "eval_seconds",
         "target_tokens_per_second",
         "peak_allocated_bytes",
@@ -1154,6 +1401,17 @@ def write_results_csv(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
                     "nll_sum": record["nll_sum"],
                     "mean_nll": record["mean_nll"],
                     "perplexity": record["perplexity"],
+                    "memory_off_mean_nll": (
+                        record["memory_off"]["mean_nll"]
+                        if isinstance(record.get("memory_off"), dict)
+                        else None
+                    ),
+                    "memory_off_penalty_nll": (
+                        float(record["memory_off"]["mean_nll"])
+                        - float(record["mean_nll"])
+                        if isinstance(record.get("memory_off"), dict)
+                        else None
+                    ),
                     "eval_seconds": record["eval_seconds"],
                     "target_tokens_per_second": record["target_tokens_per_second"],
                     "peak_allocated_bytes": record["cuda_memory"]["peak_allocated_bytes"],
@@ -1167,12 +1425,18 @@ def write_results_csv(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate paired AttnRes checkpoints on one untouched common validation manifest."
+        description="Evaluate paired depth-memory checkpoints on one common validation manifest."
+    )
+    parser.add_argument(
+        "--comparison",
+        choices=tuple(COMPARISON_PLANS),
+        default="attnres",
+        help="Use 'reader' for softmax-read versus associative-read Depth KDA.",
     )
     parser.add_argument("--runs-dir", type=Path, default=Path("att-residual-exp/runs"))
     parser.add_argument("--run-pattern", default="full_100m_seed*")
     parser.add_argument("--checkpoint-name", choices=("latest.pt", "best.pt"), default="latest.pt")
-    parser.add_argument("--architectures", nargs="+", default=list(DEFAULT_ARCHITECTURES))
+    parser.add_argument("--architectures", nargs="+")
     parser.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
     parser.add_argument("--expected-step", type=int, default=12_208)
     parser.add_argument("--eval-seed", type=int, default=DEFAULT_EVAL_SEED)
@@ -1183,7 +1447,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("att-residual-exp/runs/common_eval_4m_seed424242"),
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
@@ -1196,8 +1459,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if tuple(args.architectures) != DEFAULT_ARCHITECTURES:
-        raise ValueError(f"this comparison requires architectures {DEFAULT_ARCHITECTURES}")
+    plan = COMPARISON_PLANS[args.comparison]
+    configure_validation_pool(plan)
+    control_architecture = str(plan["control"])
+    candidate_architecture = str(plan["candidate"])
+    architectures = (control_architecture, candidate_architecture)
+    if args.architectures is not None and tuple(args.architectures) != architectures:
+        raise ValueError(
+            f"comparison {args.comparison!r} requires architectures {architectures}"
+        )
     if tuple(args.seeds) != DEFAULT_SEEDS:
         raise ValueError(
             f"the frozen six-checkpoint analysis requires seeds {DEFAULT_SEEDS}, got {tuple(args.seeds)}"
@@ -1212,15 +1482,21 @@ def main() -> None:
         raise ValueError("the frozen analysis plan requires --practical-margin 0.01")
 
     runs_dir = args.runs_dir.resolve()
-    output_dir = args.output_dir.resolve()
+    output_dir = (
+        args.output_dir
+        if args.output_dir is not None
+        else Path("att-residual-exp/runs") / str(plan["output_dir"])
+    ).resolve()
     specs = discover_checkpoints(
         runs_dir=runs_dir,
-        architectures=args.architectures,
+        architectures=architectures,
         seeds=args.seeds,
         run_pattern=args.run_pattern,
         checkpoint_name=args.checkpoint_name,
         expected_step=args.expected_step,
     )
+    if args.comparison == "reader":
+        validate_reader_ablation_matrix(specs, args.seeds)
 
     requested_device = torch.device(args.device)
     if requested_device.type == "cuda" and not torch.cuda.is_available():
@@ -1252,10 +1528,17 @@ def main() -> None:
         atomic_write_json(manifest_path, manifest)
 
     analysis_plan = {
-        "architectures": list(DEFAULT_ARCHITECTURES),
+        "comparison": args.comparison,
+        "architectures": list(architectures),
+        "control_architecture": control_architecture,
+        "candidate_architecture": candidate_architecture,
         "paired_training_seeds": list(DEFAULT_SEEDS),
-        "delta_definition": "proposal mean NLL minus baseline mean NLL",
+        "delta_definition": "candidate mean NLL minus control mean NLL",
         "practical_margin_nll": 0.01,
+        "memory_off_intervention": bool(plan["memory_off_intervention"]),
+        "validation_pool_start_token": POOL_START_TOKEN,
+        "validation_pool_token_count": POOL_TOKEN_COUNT,
+        "validation_pool_sha256": EXPECTED_POOL_SHA256,
         "primary_interval": "two-sided 95% paired Student-t interval across training seeds",
         "noninferiority_bound": "one-sided 95% paired Student-t upper bound",
         "conditional_block_interval": "paired 95% percentile bootstrap with common block resamples",
@@ -1272,6 +1555,8 @@ def main() -> None:
         "device_type": requested_device.type,
         "checkpoint_name": args.checkpoint_name,
         "expected_step": args.expected_step,
+        "comparison": args.comparison,
+        "memory_off_intervention": bool(plan["memory_off_intervention"]),
     }
     evaluation_sha256 = object_sha256(evaluation_identity)
     token_ids = map_parameter_golf_tokens(
@@ -1306,6 +1591,11 @@ def main() -> None:
         "target_tokens_per_checkpoint": manifest["sampling"]["total_target_tokens"],
         "total_target_tokens_all_checkpoints": (
             manifest["sampling"]["total_target_tokens"] * len(specs)
+        ),
+        "total_target_tokens_all_evaluations": (
+            manifest["sampling"]["total_target_tokens"]
+            * len(specs)
+            * (2 if bool(plan["memory_off_intervention"]) else 1)
         ),
         "environment": environment,
         "environment_fingerprint": environment_hash,
@@ -1370,6 +1660,21 @@ def main() -> None:
                 progress_every_blocks=args.progress_every_blocks,
                 label=label,
             )
+            memory_off_metrics: dict[str, Any] | None = None
+            memory_off_transition_count: int | None = None
+            if bool(plan["memory_off_intervention"]):
+                memory_off_transition_count = disable_memory_reads(model)
+                memory_off_metrics = evaluate_model(
+                    model=model,
+                    token_ids=token_ids,
+                    block_ids=block_ids,
+                    batch_size=args.batch_size,
+                    device=requested_device,
+                    precision=precision,
+                    progress_every_blocks=args.progress_every_blocks,
+                    label=f"{label}/memory_off",
+                )
+                validate_metric_payload(memory_off_metrics, manifest)
             record = {
                 "schema": RESULT_SCHEMA,
                 "status": "complete",
@@ -1391,6 +1696,17 @@ def main() -> None:
                 "precision": precision,
                 **metrics,
             }
+            if memory_off_metrics is not None:
+                record["memory_off"] = {
+                    "intervention": "all_depth_memory_output_gammas_set_to_zero",
+                    "transition_count": memory_off_transition_count,
+                    "normal_mean_nll": metrics["mean_nll"],
+                    "penalty_nll": (
+                        float(memory_off_metrics["mean_nll"])
+                        - float(metrics["mean_nll"])
+                    ),
+                    **memory_off_metrics,
+                }
             validate_completed_result(
                 record,
                 manifest,
@@ -1410,6 +1726,11 @@ def main() -> None:
                         "mean_nll": record["mean_nll"],
                         "perplexity": record["perplexity"],
                         "tokens_per_second": record["target_tokens_per_second"],
+                        "memory_off_penalty_nll": (
+                            record["memory_off"]["penalty_nll"]
+                            if isinstance(record.get("memory_off"), dict)
+                            else None
+                        ),
                     }
                 ),
                 flush=True,
@@ -1449,6 +1770,9 @@ def main() -> None:
         bootstrap_samples=args.bootstrap_samples,
         bootstrap_seed=args.bootstrap_seed,
         practical_margin=args.practical_margin,
+        architectures=architectures,
+        control_architecture=control_architecture,
+        candidate_architecture=candidate_architecture,
     )
     comparison["evaluation_sha256"] = evaluation_sha256
     comparison["environment_fingerprint"] = environment_hash

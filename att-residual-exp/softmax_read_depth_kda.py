@@ -16,6 +16,7 @@ gating or chunkwise training algorithm.
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import replace
 
 import torch
@@ -35,6 +36,32 @@ from _common import (
     set_seed,
 )
 from attention_residual_baseline import FullAttentionResidualLM
+
+
+SOFTMAX_DEPTH_PROFILE_KEYS = (
+    "depth_hidden_rms",
+    "sublayer_delta_rms",
+    "memory_alpha_mean",
+    "memory_beta_mean",
+    "memory_gamma",
+    "memory_state_rms",
+    "memory_state_effective_rank",
+    "memory_read_entropy_fraction",
+    "memory_read_effective_slots",
+    "memory_projected_read_rms",
+    "memory_injected_update_rms",
+    "memory_injected_to_hidden_rms_ratio",
+    "memory_injected_to_delta_rms_ratio",
+    "memory_current_write_fraction",
+)
+
+
+def _rms(value: torch.Tensor) -> torch.Tensor:
+    return value.float().pow(2).mean().sqrt()
+
+
+def _quantile(value: torch.Tensor, probability: float) -> torch.Tensor:
+    return torch.quantile(value.float().reshape(-1), probability)
 
 
 def gated_delta_depth_update(
@@ -126,6 +153,7 @@ class GatedDeltaDepthTransition(nn.Module):
         | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
     ):
         write_key, write_value, alpha, beta = self.write_parameters(delta)
+        previous_state = state
         state, innovation = gated_delta_depth_update(
             state=state,
             alpha=alpha,
@@ -141,9 +169,11 @@ class GatedDeltaDepthTransition(nn.Module):
         scores = torch.einsum("btd,btsd->bts", query, memory_key)
         scores = scores / self.read_key_dim**0.5
         read_weights = torch.softmax(scores.float(), dim=-1).to(memory_value.dtype)
-        retrieval = torch.einsum("bts,btsv->btv", read_weights, memory_value)
-        retrieval = self.out_proj(retrieval)
-        hidden = hidden + self.gamma.to(hidden.dtype) * retrieval
+        raw_retrieval = torch.einsum("bts,btsv->btv", read_weights, memory_value)
+        projected_retrieval = self.out_proj(raw_retrieval)
+        injected_update = self.gamma.to(hidden.dtype) * projected_retrieval
+        hidden_before_read = hidden
+        hidden = hidden + injected_update
 
         if not return_diagnostics:
             return hidden, state
@@ -153,31 +183,96 @@ class GatedDeltaDepthTransition(nn.Module):
             probabilities * probabilities.clamp_min(1e-9).log()
         ).sum(dim=-1)
         normalized_state = F.normalize(state, p=2, dim=-1, eps=1e-6)
-        gram = torch.einsum("btsr,btur->btsu", normalized_state, normalized_state)
+        cosine_gram = torch.einsum("btsr,btur->btsu", normalized_state, normalized_state)
         if self.num_slots > 1:
             identity = torch.eye(
                 self.num_slots,
-                device=gram.device,
+                device=cosine_gram.device,
                 dtype=torch.bool,
             )
-            slot_cosine = gram[..., ~identity].mean()
+            off_diagonal_cosine = cosine_gram[..., ~identity]
+            slot_cosine = off_diagonal_cosine.mean()
+            slot_abs_cosine = off_diagonal_cosine.abs().mean()
         else:
-            slot_cosine = gram.new_zeros(())
+            slot_cosine = cosine_gram.new_zeros(())
+            slot_abs_cosine = cosine_gram.new_zeros(())
+
+        eps = 1e-8
+        alpha_float = alpha.float()
+        beta_float = beta.float()
+        decayed_state = alpha.unsqueeze(-1) * previous_state
+        correction = state - decayed_state
+        state_gram = torch.einsum("btsr,btur->btsu", state, state)
+        state_trace = state_gram.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+        state_effective_rank = state_trace.square() / state_gram.square().sum(
+            dim=(-2, -1)
+        ).clamp_min(eps)
+
+        history_value = self.memory_value_proj(decayed_state)
+        current_write_value = self.memory_value_proj(correction)
+        history_raw_read = torch.einsum(
+            "bts,btsv->btv",
+            read_weights,
+            history_value,
+        )
+        current_write_raw_read = torch.einsum(
+            "bts,btsv->btv",
+            read_weights,
+            current_write_value,
+        )
+        history_projected_read = self.out_proj(history_raw_read)
+        current_write_projected_read = self.out_proj(current_write_raw_read)
+        history_norm = history_projected_read.float().norm(dim=-1)
+        current_norm = current_write_projected_read.float().norm(dim=-1)
+        current_write_fraction = current_norm / (
+            history_norm + current_norm + eps
+        )
+        injected_rms = _rms(injected_update)
+        hidden_rms = _rms(hidden_before_read)
+        delta_rms = _rms(delta)
 
         diagnostics = {
             "memory_read_entropy": entropy.mean(),
+            "memory_read_entropy_fraction": (
+                entropy / math.log(self.num_slots)
+                if self.num_slots > 1
+                else entropy.new_zeros(entropy.shape)
+            ).mean(),
+            "memory_read_effective_slots": entropy.exp().mean(),
             "memory_read_max_weight": probabilities.max(dim=-1).values.mean(),
-            "memory_alpha_mean": alpha.mean(),
-            "memory_alpha_min": alpha.min(),
-            "memory_beta_mean": beta.mean(),
-            "memory_innovation_rms": innovation.pow(2).mean().sqrt(),
-            "memory_state_rms": state.pow(2).mean().sqrt(),
+            "memory_alpha_mean": alpha_float.mean(),
+            "memory_alpha_std": alpha_float.std(unbiased=False),
+            "memory_alpha_min": alpha_float.min(),
+            "memory_alpha_p05": _quantile(alpha_float, 0.05),
+            "memory_alpha_p50": _quantile(alpha_float, 0.50),
+            "memory_alpha_p95": _quantile(alpha_float, 0.95),
+            "memory_alpha_below_0_1_fraction": (alpha_float < 0.1).float().mean(),
+            "memory_alpha_above_0_99_fraction": (alpha_float > 0.99).float().mean(),
+            "memory_beta_mean": beta_float.mean(),
+            "memory_beta_p05": _quantile(beta_float, 0.05),
+            "memory_beta_p50": _quantile(beta_float, 0.50),
+            "memory_beta_p95": _quantile(beta_float, 0.95),
+            "memory_innovation_rms": _rms(innovation),
+            "memory_correction_rms": _rms(correction),
+            "memory_state_rms": _rms(state),
+            "memory_state_effective_rank": state_effective_rank.mean(),
             "memory_slot_cosine": slot_cosine,
+            "memory_slot_abs_cosine": slot_abs_cosine,
             "memory_write_key_abs_mean": write_key.abs().mean(),
             "memory_write_key_max_abs": write_key.abs().max(dim=-1).values.mean(),
+            "memory_history_read_rms": _rms(history_projected_read),
+            "memory_current_write_read_rms": _rms(current_write_projected_read),
+            "memory_current_write_fraction": current_write_fraction.mean(),
+            "memory_projected_read_rms": _rms(projected_retrieval),
+            "memory_injected_update_rms": injected_rms,
+            "memory_injected_to_hidden_rms_ratio": injected_rms
+            / hidden_rms.clamp_min(eps),
+            "memory_injected_to_delta_rms_ratio": injected_rms
+            / delta_rms.clamp_min(eps),
             "memory_gamma": self.gamma,
-            "sublayer_delta_rms": delta.float().pow(2).mean().sqrt(),
-            "depth_hidden_rms": hidden.float().pow(2).mean().sqrt(),
+            "memory_gamma_abs": self.gamma.abs(),
+            "sublayer_delta_rms": delta_rms,
+            "depth_hidden_rms": _rms(hidden),
         }
         return hidden, state, diagnostics
 
@@ -333,7 +428,16 @@ class SoftmaxReadGatedDeltaDepthMemoryLM(nn.Module):
         if not return_diagnostics:
             return logits
         diagnostics = mean_diagnostics(diagnostic_rows)
+        for depth_index, row in enumerate(diagnostic_rows):
+            for key in SOFTMAX_DEPTH_PROFILE_KEYS:
+                if key not in row:
+                    continue
+                value = row[key]
+                if isinstance(value, torch.Tensor):
+                    value = value.detach().float().mean().item()
+                diagnostics[f"depth_{depth_index:02d}_{key}"] = float(value)
         diagnostics["depth_memory_transitions"] = float(len(self.transitions))
+        diagnostics["depth_diagnostic_rows"] = float(len(diagnostic_rows))
         return logits, diagnostics
 
     @torch.no_grad()

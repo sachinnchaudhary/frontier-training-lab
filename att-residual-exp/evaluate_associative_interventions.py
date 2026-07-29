@@ -1,9 +1,11 @@
 """Exploratory read-component interventions for trained associative readers.
 
 This evaluator deliberately does not alter the archived confirmatory reader
-comparison.  It reuses that comparison's frozen manifest and its normal and
-gamma-zero records, then evaluates only three new forward interventions on the
-three completed direct-reader checkpoints:
+comparison. It always reuses that comparison's frozen manifest and checkpoint
+identity. Depending on the declared reference policy, it either strictly reuses
+the archived normal and gamma-zero records or fully recomputes those references
+in the current CUDA environment before evaluating three new forward
+interventions on the completed direct-reader checkpoints:
 
 * ``history_only`` keeps the recurrent write but hides its same-step read;
 * ``current_correction_only`` reads only the same-step delta correction (whose
@@ -37,7 +39,10 @@ import torch.nn.functional as F
 from scipy.stats import t as student_t
 
 from _common import autocast_context, resolve_precision
-from _associative_intervention_integrity import validate_confirmatory_bundle
+from _associative_intervention_integrity import (
+    validate_confirmatory_bundle,
+    validate_recompute_frozen_metadata,
+)
 from associative_read_depth_kda import AssociativeReadDepthKDALM
 from evaluate_checkpoints import (
     ASSOCIATIVE_ARCHITECTURE,
@@ -78,14 +83,20 @@ from evaluate_checkpoints import (
 )
 
 
-RESULT_SCHEMA = "attres-associative-intervention-result-v1"
-SUMMARY_SCHEMA = "attres-associative-intervention-summary-v1"
+RESULT_SCHEMA = "attres-associative-intervention-result-v2"
+REFERENCE_RESULT_SCHEMA = "attres-associative-reference-result-v1"
+SUMMARY_SCHEMA = "attres-associative-intervention-summary-v2"
 ANALYSIS_KIND = "exploratory_posthoc_checkpoint_intervention"
+REFERENCE_POLICIES = ("archived_strict", "recompute_current_environment")
 DEFAULT_CONFIRMATORY_DIR = (
     ROOT / "att-residual-exp/runs/common_eval_reader_4m_seed424242"
 )
 DEFAULT_OUTPUT_DIR = (
     ROOT / "att-residual-exp/runs/associative_interventions_4m_seed424242"
+)
+DEFAULT_RECOMPUTE_OUTPUT_DIR = (
+    ROOT
+    / "att-residual-exp/runs/associative_interventions_recomputed_4m_seed424242"
 )
 
 NOVEL_MODES: dict[str, dict[str, Any]] = {
@@ -123,12 +134,12 @@ NOVEL_MODES: dict[str, dict[str, Any]] = {
 
 REFERENCE_MODES = {
     "normal": {
-        "description": "archived normal write-then-read result",
-        "source": "confirmatory_top_level",
+        "description": "unmodified trained write-then-read checkpoint",
+        "intervention": "none",
     },
     "memory_output_off": {
-        "description": "archived result with every learned memory-output gamma set to zero",
-        "source": "confirmatory_memory_off",
+        "description": "every learned memory-output gamma set to zero",
+        "intervention": "all_depth_memory_output_gammas_set_to_zero",
     },
 }
 
@@ -478,6 +489,7 @@ def load_confirmatory_references(
     manifest: Mapping[str, Any],
     current_environment: Mapping[str, Any],
     current_source_identity: Mapping[str, Any],
+    require_runtime_match: bool,
 ) -> tuple[dict[int, dict[str, dict[str, Any]]], dict[str, Any]]:
     comparison_path = confirmatory_dir / "comparison.json"
     comparison = load_json(comparison_path)
@@ -492,6 +504,7 @@ def load_confirmatory_references(
         current_environment=current_environment,
         current_source_identity=current_source_identity,
         new_source_paths=(evaluator_path, integrity_path),
+        require_runtime_match=require_runtime_match,
     )
     if comparison.get("manifest_sha256") != manifest.get("manifest_sha256"):
         raise ValueError("confirmatory comparison uses a different manifest")
@@ -605,6 +618,8 @@ def validate_intervention_result(
     checkpoint_step: int,
     environment_hash: str,
     transition_count: int,
+    reference_policy: str,
+    gpu_uuid: str | None,
 ) -> None:
     if record.get("schema") != RESULT_SCHEMA or record.get("status") != "complete":
         raise ValueError("intervention result is not complete")
@@ -619,6 +634,8 @@ def validate_intervention_result(
         "run_name": run_name,
         "checkpoint_step": checkpoint_step,
         "environment_fingerprint": environment_hash,
+        "reference_policy": reference_policy,
+        "gpu_uuid": gpu_uuid,
         "mode_definition": NOVEL_MODES[mode],
         "transition_scales": expected_transition_scales(mode, transition_count),
         "diagnostic_scope": expected_diagnostic_scope(mode),
@@ -632,6 +649,259 @@ def validate_intervention_result(
     if not isinstance(metrics, dict):
         raise ValueError("intervention result has no metric payload")
     validate_metric_payload(metrics, manifest)
+
+
+def validate_local_reference_result(
+    record: Mapping[str, Any],
+    *,
+    mode: str,
+    spec: Any,
+    manifest: Mapping[str, Any],
+    evaluation_sha256: str,
+    environment_hash: str,
+    gpu_uuid: str | None,
+    checkpoint_sha256: str,
+    expected_step: int,
+) -> None:
+    if mode not in REFERENCE_MODES:
+        raise ValueError(f"unsupported local reference mode: {mode!r}")
+    expected = {
+        "schema": REFERENCE_RESULT_SCHEMA,
+        "status": "complete",
+        "analysis_kind": ANALYSIS_KIND,
+        "reference_policy": "recompute_current_environment",
+        "reference_source": "fully_recomputed_current_environment",
+        "architecture": ASSOCIATIVE_ARCHITECTURE,
+        "seed": spec.seed,
+        "run_name": spec.run_name,
+        "mode": mode,
+        "mode_definition": REFERENCE_MODES[mode],
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_step": expected_step,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "evaluation_sha256": evaluation_sha256,
+        "environment_fingerprint": environment_hash,
+        "gpu_uuid": gpu_uuid,
+    }
+    for key, value in expected.items():
+        if record.get(key) != value:
+            raise ValueError(
+                f"local reference {key} mismatch: {record.get(key)!r} != {value!r}"
+            )
+
+    expected_transitions = 2 * int(spec.run_config["model"]["num_layers"]) - 1
+    if mode == "normal":
+        if record.get("intervention") != "none" or record.get(
+            "transition_count"
+        ) is not None:
+            raise ValueError("normal local reference has intervention metadata")
+    else:
+        if record.get("intervention") != (
+            "all_depth_memory_output_gammas_set_to_zero"
+        ) or int(record.get("transition_count", -1)) != expected_transitions:
+            raise ValueError("memory-off local reference intervention is inconsistent")
+
+    metrics = record.get("metrics")
+    if not isinstance(metrics, dict):
+        raise ValueError("local reference has no metric payload")
+    validate_metric_payload(metrics, manifest)
+    if mode == "memory_output_off":
+        diagnostics = metrics["diagnostics_first_batch"]
+        for key in ("memory_gamma", "memory_gamma_abs"):
+            if not math.isclose(
+                float(diagnostics.get(key, float("nan"))),
+                0.0,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(f"memory-off local reference has nonzero {key}")
+
+
+def evaluate_local_references(
+    *,
+    specs: Sequence[Any],
+    manifest: Mapping[str, Any],
+    evaluation_sha256: str,
+    environment_hash: str,
+    gpu_uuid: str | None,
+    checkpoint_hashes: Mapping[str, str],
+    expected_step: int,
+    token_ids: torch.Tensor,
+    block_ids: Sequence[int],
+    batch_size: int,
+    device: torch.device,
+    precision: str,
+    progress_every_blocks: int,
+    output_dir: Path,
+    resume: bool,
+) -> tuple[dict[int, dict[str, dict[str, Any]]], dict[str, Any]]:
+    result_dir = output_dir / "reference_results"
+    records: list[tuple[Path, dict[str, Any]]] = []
+    failures = 0
+    for spec in specs:
+        for mode in REFERENCE_MODES:
+            result_path = result_dir / f"seed{spec.seed}" / f"{mode}.json"
+            checkpoint_sha256 = checkpoint_hashes[str(spec.seed)]
+            if result_path.exists():
+                existing = load_json(result_path)
+                if resume and existing.get("status") == "complete":
+                    validate_local_reference_result(
+                        existing,
+                        mode=mode,
+                        spec=spec,
+                        manifest=manifest,
+                        evaluation_sha256=evaluation_sha256,
+                        environment_hash=environment_hash,
+                        gpu_uuid=gpu_uuid,
+                        checkpoint_sha256=checkpoint_sha256,
+                        expected_step=expected_step,
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "type": "reference_skip",
+                                "seed": spec.seed,
+                                "mode": mode,
+                            }
+                        ),
+                        flush=True,
+                    )
+                    records.append((result_path, existing))
+                    continue
+                if existing.get("status") == "complete":
+                    raise FileExistsError(
+                        f"completed local reference exists at {result_path}; "
+                        "use --resume or a new output directory"
+                    )
+
+            model = None
+            started_utc = utc_now()
+            cuda_cleanup(device)
+            try:
+                model, loaded_sha256, metadata = _safe_load_checkpoint_model(
+                    spec,
+                    expected_step=expected_step,
+                    known_checkpoint_sha256=checkpoint_sha256,
+                )
+                if loaded_sha256 != checkpoint_sha256:
+                    raise RuntimeError("checkpoint changed while loading local reference")
+                if any(
+                    hasattr(transition, "_intervention_original_forward")
+                    for transition in model.transitions
+                ):
+                    raise RuntimeError("fresh local reference model contains a wrapper")
+                intervention = "none"
+                transition_count: int | None = None
+                if mode == "memory_output_off":
+                    intervention = "all_depth_memory_output_gammas_set_to_zero"
+                    transition_count = disable_memory_reads(model)
+                metrics = evaluate_model(
+                    model=model,
+                    token_ids=token_ids,
+                    block_ids=block_ids,
+                    batch_size=batch_size,
+                    device=device,
+                    precision=precision,
+                    progress_every_blocks=progress_every_blocks,
+                    label=f"{ASSOCIATIVE_ARCHITECTURE}/seed{spec.seed}/{mode}",
+                )
+                record = {
+                    "schema": REFERENCE_RESULT_SCHEMA,
+                    "status": "complete",
+                    "analysis_kind": ANALYSIS_KIND,
+                    "reference_policy": "recompute_current_environment",
+                    "reference_source": "fully_recomputed_current_environment",
+                    "started_utc": started_utc,
+                    "completed_utc": utc_now(),
+                    "architecture": ASSOCIATIVE_ARCHITECTURE,
+                    "seed": spec.seed,
+                    "run_name": spec.run_name,
+                    "mode": mode,
+                    "mode_definition": REFERENCE_MODES[mode],
+                    "intervention": intervention,
+                    "transition_count": transition_count,
+                    "checkpoint_path": str(spec.checkpoint_path),
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "checkpoint_step": metadata["step"],
+                    "manifest_sha256": manifest["manifest_sha256"],
+                    "evaluation_sha256": evaluation_sha256,
+                    "environment_fingerprint": environment_hash,
+                    "gpu_uuid": gpu_uuid,
+                    "metrics": metrics,
+                }
+                validate_local_reference_result(
+                    record,
+                    mode=mode,
+                    spec=spec,
+                    manifest=manifest,
+                    evaluation_sha256=evaluation_sha256,
+                    environment_hash=environment_hash,
+                    gpu_uuid=gpu_uuid,
+                    checkpoint_sha256=checkpoint_sha256,
+                    expected_step=expected_step,
+                )
+                atomic_write_json(result_path, record)
+                records.append((result_path, record))
+                print(
+                    json.dumps(
+                        {
+                            "type": "reference_complete",
+                            "seed": spec.seed,
+                            "mode": mode,
+                            "mean_nll": metrics["mean_nll"],
+                        }
+                    ),
+                    flush=True,
+                )
+            except Exception as exc:
+                failures += 1
+                failure = {
+                    "schema": REFERENCE_RESULT_SCHEMA,
+                    "status": "failed",
+                    "analysis_kind": ANALYSIS_KIND,
+                    "reference_policy": "recompute_current_environment",
+                    "seed": spec.seed,
+                    "mode": mode,
+                    "failed_utc": utc_now(),
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "manifest_sha256": manifest["manifest_sha256"],
+                    "evaluation_sha256": evaluation_sha256,
+                    "environment_fingerprint": environment_hash,
+                    "gpu_uuid": gpu_uuid,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+                atomic_write_json(result_path, failure)
+                print(json.dumps(failure, indent=2), file=sys.stderr, flush=True)
+            finally:
+                if model is not None:
+                    del model
+                cuda_cleanup(device)
+
+    if failures:
+        raise RuntimeError(f"{failures} local reference evaluation(s) failed")
+    expected_count = len(specs) * len(REFERENCE_MODES)
+    if len(records) != expected_count:
+        raise RuntimeError("local reference result matrix is incomplete")
+    references: dict[int, dict[str, dict[str, Any]]] = {
+        spec.seed: {} for spec in specs
+    }
+    result_hashes: dict[str, str] = {}
+    for result_path, record in records:
+        seed = int(record["seed"])
+        mode = str(record["mode"])
+        if mode in references[seed]:
+            raise RuntimeError("duplicate local reference result")
+        references[seed][mode] = record["metrics"]
+        result_hashes[f"seed{seed}/{mode}"] = sha256_file(result_path)
+    return references, {
+        "source": "fully_recomputed_current_environment",
+        "reference_policy": "recompute_current_environment",
+        "environment_fingerprint": environment_hash,
+        "gpu_uuid": gpu_uuid,
+        "result_sha256_by_seed_and_mode": result_hashes,
+    }
 
 
 def _seed_inference(values: Sequence[float]) -> dict[str, Any]:
@@ -661,6 +931,10 @@ def summarize(
     bootstrap_seed: int,
     source_identity: Mapping[str, Any],
     confirmatory_identity: Mapping[str, Any],
+    reference_policy: str,
+    reference_identity: Mapping[str, Any],
+    environment: Mapping[str, Any],
+    gpu_uuid: str | None,
 ) -> dict[str, Any]:
     by_pair = {(int(row["seed"]), str(row["mode"])): row for row in records}
     expected = {(seed, mode) for seed in DEFAULT_SEEDS for mode in NOVEL_MODES}
@@ -741,8 +1015,12 @@ def summarize(
         ),
         "manifest_sha256": manifest["manifest_sha256"],
         "evaluation_sha256": evaluation_sha256,
+        "reference_policy": reference_policy,
+        "reference_identity": reference_identity,
+        "current_environment": environment,
+        "gpu_uuid": gpu_uuid,
         "source_code_identity": source_identity,
-        "confirmatory_identity": confirmatory_identity,
+        "frozen_artifact_identity": confirmatory_identity,
         "mode_summaries": mode_summaries,
     }
 
@@ -783,7 +1061,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--runs-dir", type=Path, default=Path("att-residual-exp/runs"))
     parser.add_argument("--confirmatory-dir", type=Path, default=DEFAULT_CONFIRMATORY_DIR)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--reference-policy",
+        choices=REFERENCE_POLICIES,
+        default="archived_strict",
+    )
     parser.add_argument("--run-pattern", default="full_100m_seed*")
     parser.add_argument("--checkpoint-name", choices=("latest.pt",), default="latest.pt")
     parser.add_argument("--expected-step", type=int, default=12_208)
@@ -809,11 +1092,20 @@ def main() -> None:
         raise ValueError("the intervention plan must reuse the confirmatory frozen manifest")
     if args.batch_size <= 0 or args.bootstrap_samples <= 0:
         raise ValueError("batch size and bootstrap sample count must be positive")
+    if args.reference_policy == "recompute_current_environment" and args.device != "cuda":
+        raise ValueError("current-environment reference recomputation requires CUDA")
 
     configure_validation_pool(COMPARISON_PLANS["reader"])
     runs_dir = args.runs_dir.resolve()
     confirmatory_dir = args.confirmatory_dir.resolve()
-    output_dir = args.output_dir.resolve()
+    selected_output_dir = args.output_dir
+    if selected_output_dir is None:
+        selected_output_dir = (
+            DEFAULT_RECOMPUTE_OUTPUT_DIR
+            if args.reference_policy == "recompute_current_environment"
+            else DEFAULT_OUTPUT_DIR
+        )
+    output_dir = selected_output_dir.resolve()
     _check_nonoverlap(output_dir, confirmatory_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -849,20 +1141,44 @@ def main() -> None:
     precision = resolve_precision(args.precision, requested_device)
     environment = environment_info(requested_device, precision)
     environment_hash = environment_fingerprint(environment)
+    gpu = environment.get("gpu")
+    gpu_uuid = gpu.get("uuid") if isinstance(gpu, dict) else None
     source_identity = source_code_identity()
-    references, confirmatory_identity = load_confirmatory_references(
-        confirmatory_dir=confirmatory_dir,
-        specs=specs,
-        manifest=manifest,
-        current_environment=environment,
-        current_source_identity=source_identity,
-    )
     checkpoint_hashes = {
         str(spec.seed): sha256_file(spec.checkpoint_path) for spec in specs
     }
+    evaluator_path = Path(__file__).resolve().relative_to(ROOT).as_posix()
+    integrity_path = (
+        ROOT / "att-residual-exp/_associative_intervention_integrity.py"
+    ).relative_to(ROOT).as_posix()
+    if args.reference_policy == "archived_strict":
+        references, confirmatory_identity = load_confirmatory_references(
+            confirmatory_dir=confirmatory_dir,
+            specs=specs,
+            manifest=manifest,
+            current_environment=environment,
+            current_source_identity=source_identity,
+            require_runtime_match=True,
+        )
+    else:
+        references = {}
+        confirmatory_identity = validate_recompute_frozen_metadata(
+            confirmatory_dir=confirmatory_dir,
+            manifest=manifest,
+            current_environment=environment,
+            current_source_identity=source_identity,
+            new_source_paths=(evaluator_path, integrity_path),
+            current_checkpoint_sha256_by_seed=checkpoint_hashes,
+        )
     analysis_plan = {
         "analysis_kind": ANALYSIS_KIND,
         "status": "exploratory_not_confirmatory",
+        "reference_policy": args.reference_policy,
+        "reference_source": (
+            "fully_recomputed_current_environment"
+            if args.reference_policy == "recompute_current_environment"
+            else "archived_confirmatory_records"
+        ),
         "seeds": list(DEFAULT_SEEDS),
         "novel_modes_in_order": list(NOVEL_MODES),
         "novel_mode_definitions": NOVEL_MODES,
@@ -873,16 +1189,19 @@ def main() -> None:
             mode: expected_diagnostic_scope(mode) for mode in NOVEL_MODES
         },
         "reference_environment_policy": (
-            "same runtime/hardware core with Git identity excluded because this evaluator "
-            "is new; every archived shared-source file must hash-match"
+            "recompute all normal and gamma-zero references in the current CUDA environment"
+            if args.reference_policy == "recompute_current_environment"
+            else "require the archived runtime/hardware core and all shared-source hashes"
         ),
         "timing_policy": (
             "wrapped-mode throughput includes the frozen forward plus duplicated writer/read "
             "instrumentation and must not be used for architecture-efficiency comparisons"
         ),
         "reference_anchor_policy": (
-            "re-evaluate the first frozen block for normal and gamma-zero in every seed; "
-            "require each 512-token sequence NLL sum to match the archive within 1e-5"
+            "not used; full normal and gamma-zero references are recomputed"
+            if args.reference_policy == "recompute_current_environment"
+            else "re-evaluate the first frozen block for normal and gamma-zero in every "
+            "seed and require each 512-token sequence NLL sum to match within 1e-5"
         ),
         "manifest_sha256": manifest["manifest_sha256"],
         "bootstrap_samples": args.bootstrap_samples,
@@ -890,6 +1209,8 @@ def main() -> None:
     }
     evaluation_identity = {
         "analysis_plan_sha256": object_sha256(analysis_plan),
+        "reference_policy": args.reference_policy,
+        "gpu_uuid": gpu_uuid,
         "manifest_sha256": manifest["manifest_sha256"],
         "checkpoint_sha256_by_seed": checkpoint_hashes,
         "confirmatory_identity": confirmatory_identity,
@@ -901,6 +1222,17 @@ def main() -> None:
         "expected_step": args.expected_step,
     }
     evaluation_sha256 = object_sha256(evaluation_identity)
+    run_identity = {
+        "schema": "attres-associative-intervention-run-identity-v1",
+        "evaluation_identity": evaluation_identity,
+        "evaluation_sha256": evaluation_sha256,
+    }
+    run_identity_path = output_dir / "run_identity.json"
+    if run_identity_path.exists():
+        if load_json(run_identity_path) != run_identity:
+            raise ValueError("existing output directory has a different run identity")
+    else:
+        atomic_write_json(run_identity_path, run_identity)
 
     token_ids = map_parameter_golf_tokens(
         VALIDATION_SHARD,
@@ -915,7 +1247,81 @@ def main() -> None:
     preflight_x, _ = make_cpu_batch(token_ids, first_starts)
 
     reference_anchor_rows: list[dict[str, Any]] = []
+    reference_preflight_rows: list[dict[str, Any]] = []
     for spec in specs:
+        if args.reference_policy == "recompute_current_environment":
+            for reference_mode in REFERENCE_MODES:
+                reference_model = None
+                cuda_cleanup(requested_device)
+                try:
+                    reference_model, checkpoint_sha256, metadata = (
+                        _safe_load_checkpoint_model(
+                            spec,
+                            expected_step=args.expected_step,
+                            known_checkpoint_sha256=checkpoint_hashes[str(spec.seed)],
+                        )
+                    )
+                    if any(
+                        hasattr(transition, "_intervention_original_forward")
+                        for transition in reference_model.transitions
+                    ):
+                        raise RuntimeError("fresh reference preflight contains a wrapper")
+                    transition_count: int | None = None
+                    if reference_mode == "memory_output_off":
+                        transition_count = disable_memory_reads(reference_model)
+                    reference_model = reference_model.to(requested_device).eval()
+                    x = preflight_x.to(requested_device)
+                    with torch.inference_mode(), autocast_context(
+                        requested_device, precision
+                    ):
+                        logits, diagnostics = reference_model(
+                            x, return_diagnostics=True
+                        )
+                    expected_shape = (
+                        len(first_starts),
+                        SEQUENCE_LENGTH,
+                        reference_model.config.vocab_size,
+                    )
+                    if tuple(logits.shape) != expected_shape:
+                        raise ValueError(
+                            "unexpected local-reference preflight logit shape"
+                        )
+                    if not bool(torch.isfinite(logits).all().item()) or any(
+                        not math.isfinite(float(value))
+                        for value in diagnostics.values()
+                    ):
+                        raise FloatingPointError(
+                            "local-reference preflight is non-finite"
+                        )
+                    if reference_mode == "memory_output_off":
+                        for key in ("memory_gamma", "memory_gamma_abs"):
+                            if not math.isclose(
+                                float(diagnostics.get(key, float("nan"))),
+                                0.0,
+                                rel_tol=0.0,
+                                abs_tol=1e-12,
+                            ):
+                                raise ValueError(
+                                    f"local-reference preflight has nonzero {key}"
+                                )
+                    reference_preflight_rows.append(
+                        {
+                            "seed": spec.seed,
+                            "mode": reference_mode,
+                            "checkpoint_sha256": checkpoint_sha256,
+                            "checkpoint_step": metadata["step"],
+                            "transition_count": transition_count,
+                            "forward_shape": list(logits.shape),
+                            "status": "strict_load_and_reference_forward_passed",
+                        }
+                    )
+                    del x, logits, diagnostics
+                finally:
+                    if reference_model is not None:
+                        del reference_model
+                    cuda_cleanup(requested_device)
+            continue
+
         model = None
         cuda_cleanup(requested_device)
         try:
@@ -1038,6 +1444,17 @@ def main() -> None:
                     del model
                 cuda_cleanup(requested_device)
 
+    full_reference_evaluations = (
+        len(specs) * len(REFERENCE_MODES)
+        if args.reference_policy == "recompute_current_environment"
+        else 0
+    )
+    reference_anchor_target_tokens = (
+        0
+        if args.reference_policy == "recompute_current_environment"
+        else BLOCK_TARGET_TOKENS * len(specs) * len(REFERENCE_MODES)
+    )
+    targets_per_evaluation = int(manifest["sampling"]["total_target_tokens"])
     preflight = {
         "type": "associative_intervention_preflight",
         "status": "passed",
@@ -1049,14 +1466,21 @@ def main() -> None:
         "confirmatory_identity": confirmatory_identity,
         "target_tokens_per_novel_evaluation": manifest["sampling"]["total_target_tokens"],
         "total_novel_evaluations": len(specs) * len(NOVEL_MODES),
-        "total_new_target_tokens": (
-            int(manifest["sampling"]["total_target_tokens"])
-            * len(specs)
-            * len(NOVEL_MODES)
+        "total_full_reference_evaluations": full_reference_evaluations,
+        "total_full_reference_target_tokens": (
+            targets_per_evaluation * full_reference_evaluations
         ),
-        "reference_anchor_target_tokens": (
-            BLOCK_TARGET_TOKENS * len(specs) * len(REFERENCE_MODES)
+        "total_full_evaluation_target_tokens": (
+            targets_per_evaluation
+            * (len(specs) * len(NOVEL_MODES) + full_reference_evaluations)
         ),
+        "reference_anchor_target_tokens": reference_anchor_target_tokens,
+        "total_scored_target_tokens_including_anchors": (
+            targets_per_evaluation
+            * (len(specs) * len(NOVEL_MODES) + full_reference_evaluations)
+            + reference_anchor_target_tokens
+        ),
+        "reference_preflight_rows": reference_preflight_rows,
         "reference_anchor_rows": reference_anchor_rows,
         "rows": preflight_rows,
     }
@@ -1064,6 +1488,36 @@ def main() -> None:
     print(json.dumps(preflight, indent=2), flush=True)
     if args.preflight_only:
         return
+
+    if args.reference_policy == "recompute_current_environment":
+        references, reference_identity = evaluate_local_references(
+            specs=specs,
+            manifest=manifest,
+            evaluation_sha256=evaluation_sha256,
+            environment_hash=environment_hash,
+            gpu_uuid=gpu_uuid,
+            checkpoint_hashes=checkpoint_hashes,
+            expected_step=args.expected_step,
+            token_ids=token_ids,
+            block_ids=block_ids,
+            batch_size=args.batch_size,
+            device=requested_device,
+            precision=precision,
+            progress_every_blocks=args.progress_every_blocks,
+            output_dir=output_dir,
+            resume=args.resume,
+        )
+    else:
+        reference_identity = {
+            "source": "archived_confirmatory_records",
+            "reference_policy": "archived_strict",
+            "environment_fingerprint": confirmatory_identity[
+                "preflight_environment_fingerprint"
+            ],
+            "checkpoint_result_sha256_by_seed": confirmatory_identity[
+                "checkpoint_result_sha256_by_seed"
+            ],
+        }
 
     results_dir = output_dir / "mode_results"
     records: list[dict[str, Any]] = []
@@ -1087,6 +1541,8 @@ def main() -> None:
                         checkpoint_step=args.expected_step,
                         environment_hash=environment_hash,
                         transition_count=transition_count,
+                        reference_policy=args.reference_policy,
+                        gpu_uuid=gpu_uuid,
                     )
                     print(
                         json.dumps({"type": "eval_skip", "seed": spec.seed, "mode": mode}),
@@ -1146,6 +1602,8 @@ def main() -> None:
                     "manifest_sha256": manifest["manifest_sha256"],
                     "evaluation_sha256": evaluation_sha256,
                     "environment_fingerprint": environment_hash,
+                    "reference_policy": args.reference_policy,
+                    "gpu_uuid": gpu_uuid,
                     "metrics": metrics,
                 }
                 validate_intervention_result(
@@ -1159,6 +1617,8 @@ def main() -> None:
                     checkpoint_step=args.expected_step,
                     environment_hash=environment_hash,
                     transition_count=transition_count,
+                    reference_policy=args.reference_policy,
+                    gpu_uuid=gpu_uuid,
                 )
                 atomic_write_json(result_path, record)
                 records.append(record)
@@ -1189,6 +1649,8 @@ def main() -> None:
                     "checkpoint_sha256": checkpoint_sha256,
                     "manifest_sha256": manifest["manifest_sha256"],
                     "evaluation_sha256": evaluation_sha256,
+                    "reference_policy": args.reference_policy,
+                    "gpu_uuid": gpu_uuid,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
@@ -1211,6 +1673,10 @@ def main() -> None:
         bootstrap_seed=args.bootstrap_seed,
         source_identity=source_identity,
         confirmatory_identity=confirmatory_identity,
+        reference_policy=args.reference_policy,
+        reference_identity=reference_identity,
+        environment=environment,
+        gpu_uuid=gpu_uuid,
     )
     atomic_write_json(output_dir / "summary.json", summary)
     write_csv(output_dir / "results.csv", summary)

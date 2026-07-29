@@ -4,8 +4,11 @@ This is an exploratory checkpoint analysis of the three trained
 `associative_read_depth_kda` seeds. It does not alter or overwrite the archived
 softmax-versus-associative confirmatory comparison.
 
-The evaluator reuses the archived `normal` and gamma-zero `memory_output_off`
-records, then computes three new modes on the same frozen validation blocks:
+Under `archived_strict`, the evaluator reuses the archived `normal` and
+gamma-zero `memory_output_off` records. Under
+`recompute_current_environment`, it recomputes both references on the active
+GPU. Both policies evaluate the following three new modes on the same frozen
+validation blocks:
 
 - `history_only`: read the decayed incoming state and retain the current write
   for later depth transitions, but do not read that write immediately.
@@ -23,50 +26,58 @@ not tell us how a read-then-write model would train.
 
 ## Integrity policy
 
-Before evaluating, the script:
+Both policies validate the frozen manifest, preflight, analysis-plan hash,
+shared-source hashes, and all six checkpoint identities. They also strictly
+load each direct-reader checkpoint, prove installation leaves every state-dict
+tensor unchanged, and exercise logits and diagnostics for all nine novel
+seed/mode evaluations.
 
-- validates the archived manifest, comparison, preflight, analysis, source,
-  checkpoint, normal, and memory-off hashes;
-- requires the same BF16 runtime/hardware core and byte-identical shared source
-  files as the confirmatory evaluation;
-- re-evaluates the first frozen block for normal and memory-off in every seed,
-  requiring all archived per-sequence NLL sums to reproduce within `1e-5`;
-- strictly loads every checkpoint with weights-only deserialization;
-- proves intervention installation leaves every state-dict tensor unchanged;
-- exercises logits and diagnostics for all nine novel seed/mode evaluations.
+`archived_strict` additionally requires the archived BF16 runtime/hardware core,
+loads the archived metric records, and reproduces the first frozen normal and
+memory-off block within `1e-5` per sequence.
 
-Do not bypass a failed compatibility or numerical-anchor check. If the old
-environment cannot be reproduced, revise the analysis plan to recompute full
-normal and memory-off references in the new environment.
+`recompute_current_environment` is the hardware-migration policy. It never
+opens `comparison.json` or archived checkpoint-result JSON files, and therefore
+cannot import their NLLs. It uses only frozen provenance from `preflight.json`,
+then fully recomputes normal and gamma-zero for all three seeds on the active
+GPU. Every resumable result is pinned to the reference policy, environment,
+checkpoint hash, source hash, and physical GPU UUID.
+
+Do not disable a failed integrity check. Use
+`recompute_current_environment` when the archived hardware is unavailable.
 
 ## Run
 
-From the repository root:
+For a hardware migration, from the repository root:
 
 ```bash
 python att-residual-exp/test_associative_interventions.py
 python att-residual-exp/test_associative_intervention_integrity.py
+python att-residual-exp/test_associative_reference_policy.py
+python att-residual-exp/test_associative_reference_resume.py
 python att-residual-exp/test_evaluator.py
 
-python -u att-residual-exp/evaluate_associative_interventions.py --preflight-only
+python -u att-residual-exp/evaluate_associative_interventions.py \
+  --reference-policy recompute_current_environment --preflight-only
 
 set -o pipefail
-python -u att-residual-exp/evaluate_associative_interventions.py --resume 2>&1 \
-  | tee -a /workspace/attres-associative-interventions.log
+python -u att-residual-exp/evaluate_associative_interventions.py \
+  --reference-policy recompute_current_environment --resume 2>&1 \
+  | tee -a /workspace/attres-associative-interventions-rtx4090.log
 ```
 
-The nine new passes contain 37,748,736 scored target tokens. The six numerical
-anchors add 98,304 target tokens. Results are written separately under:
+This performs 15 full passes: five modes times three seeds, containing
+62,914,560 scored target tokens. Results are written separately under:
 
 ```text
-att-residual-exp/runs/associative_interventions_4m_seed424242/
+att-residual-exp/runs/associative_interventions_recomputed_4m_seed424242/
 ```
 
 Completion check:
 
 ```bash
 test -f \
-  att-residual-exp/runs/associative_interventions_4m_seed424242/summary.json \
+  att-residual-exp/runs/associative_interventions_recomputed_4m_seed424242/summary.json \
   && echo COMPLETE || echo INCOMPLETE
 ```
 

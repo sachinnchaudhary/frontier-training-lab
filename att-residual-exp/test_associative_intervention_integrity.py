@@ -10,7 +10,10 @@ from pathlib import Path
 
 import torch
 
-from _associative_intervention_integrity import validate_confirmatory_bundle
+from _associative_intervention_integrity import (
+    validate_confirmatory_bundle,
+    validate_recompute_frozen_metadata,
+)
 from evaluate_associative_interventions import (
     install_intervention,
     source_code_identity,
@@ -191,6 +194,7 @@ def check_confirmatory_bundle_links() -> None:
             "checkpoint_sha256": checkpoint_hashes[
                 f"{architecture}/seed{seed}"
             ],
+            "status": "strict_load_and_forward_passed",
         }
         for architecture in (PROPOSAL_ARCHITECTURE, ASSOCIATIVE_ARCHITECTURE)
         for seed in DEFAULT_SEEDS
@@ -223,6 +227,46 @@ def check_confirmatory_bundle_links() -> None:
         (directory / "preflight.json").write_text(
             json.dumps(preflight), encoding="utf-8"
         )
+        # Recompute policy must use preflight provenance without opening the
+        # archived metric-bearing comparison or checkpoint result files.
+        (directory / "comparison.json").write_text(
+            "this is deliberately not JSON", encoding="utf-8"
+        )
+        current_direct_hashes = {
+            str(seed): checkpoint_hashes[
+                f"{ASSOCIATIVE_ARCHITECTURE}/seed{seed}"
+            ]
+            for seed in DEFAULT_SEEDS
+        }
+        recompute_identity = validate_recompute_frozen_metadata(
+            confirmatory_dir=directory,
+            manifest={"manifest_sha256": "manifest-hash"},
+            current_environment=current_environment,
+            current_source_identity=current_source,
+            new_source_paths=(evaluator_path, integrity_path),
+            current_checkpoint_sha256_by_seed=current_direct_hashes,
+        )
+        if recompute_identity["archived_metric_artifacts_loaded"] is not False:
+            raise AssertionError("recompute provenance loaded archived metrics")
+        if recompute_identity["runtime_match_required"] is not False:
+            raise AssertionError("recompute provenance required archived hardware")
+
+        tampered_direct_hashes = dict(current_direct_hashes)
+        tampered_direct_hashes[str(DEFAULT_SEEDS[0])] = "tampered"
+        try:
+            validate_recompute_frozen_metadata(
+                confirmatory_dir=directory,
+                manifest={"manifest_sha256": "manifest-hash"},
+                current_environment=current_environment,
+                current_source_identity=current_source,
+                new_source_paths=(evaluator_path, integrity_path),
+                current_checkpoint_sha256_by_seed=tampered_direct_hashes,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("changed recompute checkpoint was accepted")
+
         identity = validate_confirmatory_bundle(
             confirmatory_dir=directory,
             comparison=comparison,
@@ -265,6 +309,20 @@ def check_confirmatory_bundle_links() -> None:
             pass
         else:
             raise AssertionError("incompatible runtime/precision was accepted")
+
+        migrated = validate_confirmatory_bundle(
+            confirmatory_dir=directory,
+            comparison=comparison,
+            manifest={"manifest_sha256": "manifest-hash"},
+            current_environment=changed_runtime,
+            current_source_identity=current_source,
+            new_source_paths=(evaluator_path, integrity_path),
+            require_runtime_match=False,
+        )
+        if migrated["runtime_environment_matches_archive"] is not False:
+            raise AssertionError("hardware-migration mismatch was not recorded")
+        if migrated["runtime_match_required"] is not False:
+            raise AssertionError("recompute policy unexpectedly required archived runtime")
 
 
 def main() -> None:

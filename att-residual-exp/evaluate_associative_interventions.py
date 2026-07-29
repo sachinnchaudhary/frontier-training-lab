@@ -409,8 +409,32 @@ def install_intervention(
 def _safe_load_checkpoint_model(*args: Any, **kwargs: Any) -> Any:
     # Legacy checkpoints serialized ``torch.__version__`` as TorchVersion.
     # Keep weights-only loading and allowlist only that known benign subclass.
-    with torch.serialization.safe_globals([torch.torch_version.TorchVersion]):
+    allowed = [torch.torch_version.TorchVersion]
+    safe_globals_context = getattr(torch.serialization, "safe_globals", None)
+    if callable(safe_globals_context):
+        with safe_globals_context(allowed):
+            return load_checkpoint_model(*args, **kwargs)
+
+    # Older PyTorch releases expose only the process-wide registration API.
+    # Scope it manually and restore any pre-existing allowlist on every exit.
+    add_safe_globals = getattr(torch.serialization, "add_safe_globals", None)
+    get_safe_globals = getattr(torch.serialization, "get_safe_globals", None)
+    clear_safe_globals = getattr(torch.serialization, "clear_safe_globals", None)
+    if not all(
+        callable(api)
+        for api in (add_safe_globals, get_safe_globals, clear_safe_globals)
+    ):
+        raise RuntimeError(
+            "this PyTorch build cannot safely scope legacy TorchVersion metadata"
+        )
+    previous = list(get_safe_globals())
+    try:
+        add_safe_globals(allowed)
         return load_checkpoint_model(*args, **kwargs)
+    finally:
+        clear_safe_globals()
+        if previous:
+            add_safe_globals(previous)
 
 
 def _metrics_view(record: Mapping[str, Any]) -> dict[str, Any]:
